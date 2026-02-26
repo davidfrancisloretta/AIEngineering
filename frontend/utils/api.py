@@ -81,6 +81,20 @@ class ApiClient:
         return resp.json()
 
     # --------------------------------------------------
+    # Excel upload
+    # --------------------------------------------------
+    def upload_excel(self, file_bytes: bytes, filename: str) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/upload/excel",
+            files={"file": (filename, file_bytes, "application/octet-stream")},
+            headers=self._headers,
+            timeout=30,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    # --------------------------------------------------
     # Demo
     # --------------------------------------------------
     def seed_demo_data(self) -> dict:

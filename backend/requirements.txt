@@ -11,3 +11,6 @@ bcrypt==4.0.1
 requests
 pyyaml
 python-multipart
+pandas
+openpyxl
+xlrd

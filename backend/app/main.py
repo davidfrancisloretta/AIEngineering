@@ -9,7 +9,7 @@ from schemas import MetricCreate, MetricUpdate, MetricResponse
 from dependencies import get_db
 import services.metrics as metric_service
 from services.auth import hash_password
-from routers import auth, config, data, demo
+from routers import auth, config, data, demo, upload
 
 DEMO_EMAIL = "demo@raveanalytics.com"
 DEMO_PASSWORD = "Demo1234!"
@@ -40,6 +40,7 @@ app.include_router(auth.router)
 app.include_router(config.router)
 app.include_router(data.router)
 app.include_router(demo.router)
+app.include_router(upload.router)
 
 
 # -------------------------------
