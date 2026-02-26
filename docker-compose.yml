@@ -4,9 +4,13 @@ services:
     container_name: ai_backend
     depends_on:
       - db
+      - ollama
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/analytics
       - SECRET_KEY=super-secret-jwt-key-change-in-production-32chars!
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_EMBED_MODEL=nomic-embed-text
+      - OLLAMA_LLM_MODEL=tinyllama
     ports:
       - "8000:8000"
 
@@ -21,7 +25,7 @@ services:
       - "8501:8501"
 
   db:
-    image: postgres:15
+    image: pgvector/pgvector:pg15
     container_name: analytics_db
     environment:
       POSTGRES_USER: postgres
@@ -29,3 +33,31 @@ services:
       POSTGRES_DB: analytics
     ports:
       - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        sleep 10 &&
+        ollama pull nomic-embed-text &&
+        ollama pull tinyllama &&
+        wait
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  pg_data:
+  ollama_data:

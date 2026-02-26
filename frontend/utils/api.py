@@ -117,3 +117,94 @@ class ApiClient:
         if not resp.ok:
             _raise(resp)
         return resp.json()
+
+    # --------------------------------------------------
+    # Clinical trial data
+    # --------------------------------------------------
+    def seed_clinical_data(self) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/clinical/seed", headers=self._headers, timeout=30
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def clear_clinical_data(self) -> None:
+        resp = requests.delete(
+            f"{API_BASE}/clinical/seed", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+
+    def get_studies(self) -> list:
+        resp = requests.get(f"{API_BASE}/clinical/studies", headers=self._headers)
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def get_subjects(
+        self,
+        study_id: int | None = None,
+        site_id: str | None = None,
+    ) -> list:
+        params: dict = {}
+        if study_id:
+            params["study_id"] = study_id
+        if site_id:
+            params["site_id"] = site_id
+        resp = requests.get(
+            f"{API_BASE}/clinical/subjects",
+            headers=self._headers,
+            params=params,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def get_visits(self, subject_id: int) -> list:
+        resp = requests.get(
+            f"{API_BASE}/clinical/visits",
+            headers=self._headers,
+            params={"subject_id": subject_id},
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def get_forms(self, visit_id: int) -> list:
+        resp = requests.get(
+            f"{API_BASE}/clinical/forms/{visit_id}", headers=self._headers
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    # --------------------------------------------------
+    # RAG
+    # --------------------------------------------------
+    def rag_status(self) -> dict:
+        resp = requests.get(
+            f"{API_BASE}/rag/status", headers=self._headers, timeout=10
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def rag_ingest(self) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/rag/ingest", headers=self._headers, timeout=300
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def rag_chat(self, question: str, top_k: int = 5) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/rag/chat",
+            json={"question": question, "top_k": top_k},
+            headers=self._headers,
+            timeout=180,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()

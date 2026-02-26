@@ -10,6 +10,9 @@ from dependencies import get_db
 import services.metrics as metric_service
 from services.auth import hash_password
 from routers import auth, config, data, demo, upload
+from routers import clinical as clinical_router
+from routers import rag as rag_router
+import models_clinical  # noqa: F401 — registers clinical models with Base.metadata
 
 DEMO_EMAIL = "demo@raveanalytics.com"
 DEMO_PASSWORD = "Demo1234!"
@@ -41,6 +44,8 @@ app.include_router(config.router)
 app.include_router(data.router)
 app.include_router(demo.router)
 app.include_router(upload.router)
+app.include_router(clinical_router.router)
+app.include_router(rag_router.router)
 
 
 # -------------------------------
