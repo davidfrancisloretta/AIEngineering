@@ -81,6 +81,21 @@ class ApiClient:
         return resp.json()
 
     # --------------------------------------------------
+    # Demo
+    # --------------------------------------------------
+    def seed_demo_data(self) -> dict:
+        resp = requests.post(f"{API_BASE}/demo/seed", headers=self._headers, timeout=15)
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def export_yaml(self) -> str:
+        resp = requests.get(f"{API_BASE}/demo/export/yaml", headers=self._headers, timeout=15)
+        if not resp.ok:
+            _raise(resp)
+        return resp.text
+
+    # --------------------------------------------------
     # Campaign metrics (public)
     # --------------------------------------------------
     def get_metrics(self) -> list:
