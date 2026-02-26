@@ -1,0 +1,31 @@
+services:
+  backend:
+    build: ./backend
+    container_name: ai_backend
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/analytics
+      - SECRET_KEY=super-secret-jwt-key-change-in-production-32chars!
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    container_name: ai_frontend
+    depends_on:
+      - backend
+    environment:
+      - API_URL=http://backend:8000
+    ports:
+      - "8501:8501"
+
+  db:
+    image: postgres:15
+    container_name: analytics_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: analytics
+    ports:
+      - "5432:5432"
