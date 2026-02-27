@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 from dependencies import get_db, get_current_user
@@ -10,8 +10,10 @@ from schemas_clinical import (
     VisitResponse,
     FormResponse,
     ClinicalSeedResponse,
+    ODMUploadResponse,
 )
 from services.clinical_demo import seed_clinical_study
+import services.odm_parser as odm_parser
 
 router = APIRouter(prefix="/clinical", tags=["clinical"])
 
@@ -100,3 +102,45 @@ def list_forms(
 ):
     """List all forms (VS/AE/CM/LB) for a visit."""
     return db.query(ClinicalForm).filter(ClinicalForm.visit_id == visit_id).all()
+
+
+@router.post("/upload-odm", response_model=ODMUploadResponse)
+async def upload_odm(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload a CDISC ODM XML file (.xml or .odm) exported from Medidata Rave.
+    Parses Study / Subject / Visit / Form data and upserts into clinical tables.
+    Supports standard ODM 1.3 and Medidata Rave extensions (mdsol namespace).
+    """
+    # Validate file type
+    filename = file.filename or ""
+    if not filename.lower().endswith((".xml", ".odm")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .xml or .odm files are accepted.",
+        )
+
+    xml_bytes = await file.read()
+    if not xml_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        result = odm_parser.parse_and_ingest(xml_bytes, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return ODMUploadResponse(
+        study    = result["study"],
+        subjects = result["subjects"],
+        visits   = result["visits"],
+        forms    = result["forms"],
+        warnings = result.get("warnings", []),
+        message  = (
+            f"ODM import complete — {result['subjects']} subjects, "
+            f"{result['visits']} visits, {result['forms']} forms loaded "
+            f"from study {result['study']}."
+        ),
+    )

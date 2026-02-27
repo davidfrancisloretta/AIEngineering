@@ -22,7 +22,32 @@ st.markdown("---")
 # ── Sidebar: actions ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Data Actions")
-    if st.button("🧬 Seed Demo Data", use_container_width=True, type="primary"):
+
+    # ── ODM XML Upload ─────────────────────────────────────────────────────
+    st.markdown("**Upload Rave ODM File**")
+    odm_file = st.file_uploader(
+        "Choose .xml or .odm file",
+        type=["xml", "odm"],
+        help="Export from Medidata Rave → Datasets → ClinicalAuditRecords.odm or any standard ODM export",
+    )
+    if odm_file is not None:
+        if st.button("📤 Import ODM Data", use_container_width=True, type="primary"):
+            with st.spinner(f"Parsing {odm_file.name} and importing…"):
+                try:
+                    r = client.upload_odm(odm_file.read(), odm_file.name)
+                    st.success(f"✅ {r['message']}")
+                    if r.get("warnings"):
+                        for w in r["warnings"]:
+                            st.warning(f"⚠️ {w}")
+                    st.rerun()
+                except ApiError as e:
+                    st.error(f"❌ {e}")
+
+    st.markdown("---")
+
+    # ── Demo data ──────────────────────────────────────────────────────────
+    st.markdown("**Demo Dataset**")
+    if st.button("🧬 Seed Demo Data", use_container_width=True):
         with st.spinner("Generating CARDIO-2024 demo dataset…"):
             try:
                 r = client.seed_clinical_data()
@@ -43,7 +68,7 @@ with st.sidebar:
                 st.error(f"❌ {e}")
 
     st.markdown("---")
-    if st.button("🗑️ Clear Demo Data", use_container_width=True):
+    if st.button("🗑️ Clear All Data", use_container_width=True):
         with st.spinner("Clearing data…"):
             try:
                 client.clear_clinical_data()

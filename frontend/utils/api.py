@@ -208,3 +208,17 @@ class ApiClient:
         if not resp.ok:
             _raise(resp)
         return resp.json()
+
+    # --------------------------------------------------
+    # ODM XML upload
+    # --------------------------------------------------
+    def upload_odm(self, file_bytes: bytes, filename: str) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/clinical/upload-odm",
+            files={"file": (filename, file_bytes, "application/xml")},
+            headers=self._headers,
+            timeout=120,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()

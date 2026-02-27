@@ -107,3 +107,14 @@ class RAGStatusResponse(BaseModel):
     chunk_count:  int
     embed_model:  str
     llm_model:    str
+
+
+# ── ODM Upload ──────────────────────────────────────────────────────────────
+
+class ODMUploadResponse(BaseModel):
+    study:    str
+    subjects: int
+    visits:   int
+    forms:    int
+    warnings: list[str] = []
+    message:  str
