@@ -265,16 +265,41 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
     def tag(local: str) -> str:
         return f"{{{odm_ns}}}{local}" if odm_ns else local
 
-    # ── Find Study element ─────────────────────────────────────────────────
+    # ── Find Study element (optional — absent in ClinicalAuditRecords format) ─
     study_elem = root.find(tag("Study"))
     if study_elem is None:
-        # Try without namespace
         study_elem = root.find("Study")
-    if study_elem is None:
-        raise ValueError("No <Study> element found in ODM XML.")
 
-    form_labels, item_labels = _build_label_maps(study_elem)
-    study_meta               = _extract_study_meta(study_elem)
+    if study_elem is not None:
+        form_labels, item_labels = _build_label_maps(study_elem)
+        study_meta               = _extract_study_meta(study_elem)
+    else:
+        # ClinicalAuditRecords / transactional ODM — derive study OID from
+        # the first <ClinicalData StudyOID="..."> attribute
+        form_labels  = {}
+        item_labels  = {}
+        cd_elem      = root.find(tag("ClinicalData"))
+        if cd_elem is None:
+            cd_elem  = root.find("ClinicalData")
+        if cd_elem is None:
+            raise ValueError(
+                "No <Study> or <ClinicalData> element found. "
+                "File does not appear to be a valid CDISC ODM document."
+            )
+        raw_oid    = _attr(cd_elem, "StudyOID") or "UNKNOWN"
+        study_meta = {
+            "study_oid":        raw_oid,
+            "protocol_name":    raw_oid,
+            "phase":            _guess_phase(raw_oid),
+            "sponsor":          None,
+            "therapeutic_area": _guess_ta(raw_oid),
+            "objective":        f"Imported from Medidata Rave ClinicalAuditRecords — {raw_oid}",
+            "status":           "Active",
+        }
+        warnings.append(
+            "File is in ClinicalAuditRecords (transactional) format — "
+            "study metadata (phase, sponsor) not available; defaults applied."
+        )
 
     # ── Upsert Study ───────────────────────────────────────────────────────
     study_obj = (
