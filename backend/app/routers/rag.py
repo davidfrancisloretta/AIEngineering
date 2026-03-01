@@ -9,9 +9,12 @@ from schemas_clinical import (
     RAGChatResponse,
     RAGIngestResponse,
     RAGStatusResponse,
+    SQLQueryRequest,
+    SQLQueryResponse,
 )
 import services.rag as rag_service
 import services.ingestion as ingestion_service
+import services.text_to_sql as text_to_sql_service
 from services.llm import ollama_ready, list_models, EMBED_MODEL, LLM_MODEL
 
 router = APIRouter(prefix="/rag", tags=["rag"])
@@ -74,4 +77,24 @@ def chat(
             detail="Ollama service is not available. Please wait for models to finish loading.",
         )
     result = rag_service.answer_question(db, body.question, top_k=body.top_k)
+    return result
+
+
+@router.post("/sql-query", response_model=SQLQueryResponse)
+def sql_query(
+    body: SQLQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Answer a clinical trial question using Text-to-SQL:
+    question → llama3.2:3b generates SQL → execute → LLM summarises → answer + raw data.
+    No embeddings or vector search required.
+    """
+    try:
+        result = text_to_sql_service.sql_chat(db, body.question)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return result

@@ -15,6 +15,7 @@ from routers import auth, config, data, demo, upload
 from routers import clinical as clinical_router
 from routers import rag as rag_router
 import models_clinical  # noqa: F401 — registers clinical models with Base.metadata
+from services.text_to_sql import ensure_views
 
 DEMO_EMAIL = "demo@raveanalytics.com"
 DEMO_PASSWORD = "Demo1234!"
@@ -65,6 +66,11 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     _ensure_vector_extension()
     _seed_demo_user()
+    db: Session = SessionLocal()
+    try:
+        ensure_views(db)
+    finally:
+        db.close()
     yield
 
 

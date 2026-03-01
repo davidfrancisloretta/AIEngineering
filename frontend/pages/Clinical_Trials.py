@@ -17,33 +17,39 @@ client = ApiClient(token=st.session_state["token"])
 
 st.title("🏥 Clinical Trials")
 st.markdown("**CARDIO-2024** — Phase III Cardiovascular Study | CardioPharm International")
-st.markdown("---")
 
-# ── Sidebar: actions ──────────────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("Data Actions")
-
-    # ── ODM XML Upload ─────────────────────────────────────────────────────
-    st.markdown("**Upload Rave ODM File**")
+# ── ODM Upload panel (main area, always visible) ───────────────────────────────
+with st.expander("📂 Import Rave ODM File", expanded=True):
     odm_file = st.file_uploader(
         "Choose .xml or .odm file",
         type=["xml", "odm"],
-        help="Export from Medidata Rave → Datasets → ClinicalAuditRecords.odm or any standard ODM export",
+        key="odm_uploader",
+        help="Export from Medidata Rave → Datasets → ClinicalAuditRecords.odm",
     )
     if odm_file is not None:
-        if st.button("📤 Import ODM Data", use_container_width=True, type="primary"):
-            with st.spinner(f"Parsing {odm_file.name} and importing…"):
-                try:
-                    r = client.upload_odm(odm_file.read(), odm_file.name)
-                    st.success(f"✅ {r['message']}")
-                    if r.get("warnings"):
-                        for w in r["warnings"]:
-                            st.warning(f"⚠️ {w}")
-                    st.rerun()
-                except ApiError as e:
-                    st.error(f"❌ {e}")
+        st.caption(f"Selected: **{odm_file.name}** ({odm_file.size:,} bytes)")
+        odm_bytes = odm_file.read()
+        st.caption(f"Bytes read: {len(odm_bytes):,}")
+        if st.button("📤 Import ODM Data", type="primary"):
+            if not odm_bytes:
+                st.error("❌ File is empty — please re-select the file.")
+            else:
+                with st.spinner(f"Parsing {odm_file.name} and importing…"):
+                    try:
+                        r = client.upload_odm(odm_bytes, odm_file.name)
+                        st.success(f"✅ {r['message']}")
+                        if r.get("warnings"):
+                            for w in r["warnings"]:
+                                st.warning(f"⚠️ {w}")
+                        st.rerun()
+                    except ApiError as e:
+                        st.error(f"❌ {e}")
 
-    st.markdown("---")
+st.markdown("---")
+
+# ── Sidebar: dataset actions ───────────────────────────────────────────────────
+with st.sidebar:
+    st.subheader("Data Actions")
 
     # ── Demo data ──────────────────────────────────────────────────────────
     st.markdown("**Demo Dataset**")

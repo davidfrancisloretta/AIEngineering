@@ -109,6 +109,21 @@ class RAGStatusResponse(BaseModel):
     llm_model:    str
 
 
+# ── Text-to-SQL ────────────────────────────────────────────────────────────────
+
+class SQLQueryRequest(BaseModel):
+    question: str
+
+
+class SQLQueryResponse(BaseModel):
+    answer:    str
+    sql:       str
+    columns:   list[str]
+    rows:      list[list]
+    row_count: int
+    model:     str
+
+
 # ── ODM Upload ──────────────────────────────────────────────────────────────
 
 class ODMUploadResponse(BaseModel):

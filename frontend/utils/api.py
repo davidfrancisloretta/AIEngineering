@@ -210,6 +210,20 @@ class ApiClient:
         return resp.json()
 
     # --------------------------------------------------
+    # Text-to-SQL
+    # --------------------------------------------------
+    def rag_sql_query(self, question: str) -> dict:
+        resp = requests.post(
+            f"{API_BASE}/rag/sql-query",
+            json={"question": question},
+            headers=self._headers,
+            timeout=180,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    # --------------------------------------------------
     # ODM XML upload
     # --------------------------------------------------
     def upload_odm(self, file_bytes: bytes, filename: str) -> dict:

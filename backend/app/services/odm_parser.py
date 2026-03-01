@@ -20,37 +20,58 @@ from sqlalchemy.orm import Session
 
 from models_clinical import ClinicalStudy, ClinicalSubject, ClinicalVisit, ClinicalForm
 
-# XML namespaces used by CDISC ODM and Medidata Rave
-NS_ODM   = "http://www.cdisc.org/ns/odm/v1.3"
-NS_MDSOL = "http://www.mdsol.com/ns/odm/metadata"
-
 # Common CDISC demographic item OID fragments (case-insensitive match)
 _AGE_KEYS        = ("AGE", "AGEBIRTH")
 _SEX_KEYS        = ("SEX", "GENDER")
 _RACE_KEYS       = ("RACE",)
 _ENROLL_KEYS     = ("ENRDT", "RFSTDTC", "ICFDAT", "BRTHDAT", "RFICDTC")
-_SITE_NAME_KEYS  = ("SITENAME", "SITE_NAME", "LOCATIONNAME")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Namespace-agnostic helpers
 # ---------------------------------------------------------------------------
 
-def _tag(local: str, ns: str = NS_ODM) -> str:
-    return f"{{{ns}}}{local}"
+def _local(tag: str) -> str:
+    """Strip Clark-notation namespace from tag: {ns}local → local."""
+    return tag.split("}")[-1] if "}" in tag else tag
 
 
-def _attr(elem: ET.Element, *names: str, ns: str = "") -> Optional[str]:
-    """Return the first matching attribute value, trying with and without namespace."""
+def _find(elem: ET.Element, local_name: str) -> Optional[ET.Element]:
+    """Find first DIRECT child matching local name, ignoring namespace."""
+    for child in elem:
+        if _local(child.tag) == local_name:
+            return child
+    return None
+
+
+def _findall(elem: ET.Element, local_name: str) -> list:
+    """Find all DIRECT children matching local name, ignoring namespace."""
+    return [child for child in elem if _local(child.tag) == local_name]
+
+
+def _iterlocal(elem: ET.Element, local_name: str):
+    """Iterate ALL descendants matching local name, ignoring namespace."""
+    for el in elem.iter():
+        if _local(el.tag) == local_name:
+            yield el
+
+
+def _attr(elem: ET.Element, *names: str) -> Optional[str]:
+    """Return first matching attribute value, trying plain name and all
+    Clark-notation variants found on the element."""
     for name in names:
-        v = elem.get(name) or elem.get(f"{{{ns}}}{name}" if ns else name)
+        # Plain attribute
+        v = elem.get(name)
         if v:
             return v.strip()
+        # Try any namespace variant: scan all attrib keys
+        for k, v in elem.attrib.items():
+            if _local(k) == name and v:
+                return v.strip()
     return None
 
 
 def _parse_date(value: str) -> Optional[date]:
-    """Parse ISO-8601 date string to date, tolerating datetime strings."""
     if not value:
         return None
     try:
@@ -60,7 +81,6 @@ def _parse_date(value: str) -> Optional[date]:
 
 
 def _match_key(oid: str, keys: tuple) -> bool:
-    """Return True if the item OID contains any of the key fragments (case-insensitive)."""
     upper = oid.upper()
     return any(k in upper for k in keys)
 
@@ -70,27 +90,22 @@ def _clean_text(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Study-level metadata extraction
+# Study-level metadata
 # ---------------------------------------------------------------------------
 
 def _extract_study_meta(study_elem: ET.Element) -> dict:
-    """Extract study-level metadata from <Study> element."""
-    oid          = _attr(study_elem, "OID") or "UNKNOWN"
-    global_vars  = study_elem.find(_tag("GlobalVariables"))
+    oid         = _attr(study_elem, "OID") or "UNKNOWN"
+    global_vars = _find(study_elem, "GlobalVariables")
 
-    name         = ""
-    protocol     = ""
-    description  = ""
-
+    name = protocol = description = ""
     if global_vars is not None:
-        name_el  = global_vars.find(_tag("StudyName"))
-        proto_el = global_vars.find(_tag("ProtocolName"))
-        desc_el  = global_vars.find(_tag("StudyDescription"))
+        name_el  = _find(global_vars, "StudyName")
+        proto_el = _find(global_vars, "ProtocolName")
+        desc_el  = _find(global_vars, "StudyDescription")
         name        = _clean_text(name_el.text)  if name_el  is not None else oid
         protocol    = _clean_text(proto_el.text) if proto_el is not None else oid
         description = _clean_text(desc_el.text)  if desc_el  is not None else ""
 
-    # Try to extract phase / sponsor from description or oid
     phase   = _guess_phase(oid + " " + description)
     sponsor = _guess_sponsor(oid + " " + description)
 
@@ -138,149 +153,113 @@ def _guess_ta(text: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# MetaDataVersion — collect form/item name lookups
+# MetaDataVersion — form / item label lookup maps
 # ---------------------------------------------------------------------------
 
-def _build_label_maps(study_elem: ET.Element) -> tuple[dict, dict]:
-    """
-    Return (form_labels, item_labels):
-      form_labels[form_oid]  = human-readable form name
-      item_labels[item_oid]  = human-readable item name / question text
-    """
-    form_labels: dict[str, str] = {}
-    item_labels: dict[str, str] = {}
+def _build_label_maps(study_elem: ET.Element) -> tuple:
+    form_labels: dict = {}
+    item_labels: dict = {}
 
-    for mdv in study_elem.findall(_tag("MetaDataVersion")):
-        for fd in mdv.findall(_tag("FormDef")):
+    for mdv in _iterlocal(study_elem, "MetaDataVersion"):
+        for fd in _findall(mdv, "FormDef"):
             oid  = _attr(fd, "OID") or ""
             name = _attr(fd, "Name") or oid
             form_labels[oid] = name
 
-        for idef in mdv.findall(_tag("ItemDef")):
+        for idef in _iterlocal(mdv, "ItemDef"):
             oid      = _attr(idef, "OID") or ""
             name     = _attr(idef, "Name") or ""
-            question = idef.find(f".//{_tag('TranslatedText')}")
-            label    = (question.text.strip() if question is not None and question.text else name) or oid
+            question = next(_iterlocal(idef, "TranslatedText"), None)
+            label    = (question.text.strip()
+                        if question is not None and question.text else name) or oid
             item_labels[oid] = label
 
     return form_labels, item_labels
 
 
 # ---------------------------------------------------------------------------
-# Subject demographics extraction
+# Demographics extraction
 # ---------------------------------------------------------------------------
 
 def _extract_demographics(subject_elem: ET.Element, item_labels: dict) -> dict:
-    """
-    Walk all ItemData under the subject and try to map common demographic fields.
-    Returns partial dict suitable for ClinicalSubject fields.
-    """
     demo: dict = {}
-
-    for item_data in subject_elem.iter(_tag("ItemData")):
+    for item_data in _iterlocal(subject_elem, "ItemData"):
         oid   = _attr(item_data, "ItemOID") or ""
         value = _attr(item_data, "Value") or ""
         if not oid or not value:
             continue
-
         if not demo.get("age") and _match_key(oid, _AGE_KEYS):
             try:
                 demo["age"] = int(float(value))
             except ValueError:
                 pass
-
         if not demo.get("sex") and _match_key(oid, _SEX_KEYS):
             demo["sex"] = value[:10]
-
         if not demo.get("race") and _match_key(oid, _RACE_KEYS):
             demo["race"] = value[:50]
-
         if not demo.get("enrollment_date") and _match_key(oid, _ENROLL_KEYS):
             demo["enrollment_date"] = _parse_date(value)
-
     return demo
 
 
 # ---------------------------------------------------------------------------
-# Form data extraction — collect all ItemData into a keyed dict
+# Form data extraction
 # ---------------------------------------------------------------------------
 
 def _extract_form_data(form_elem: ET.Element, item_labels: dict) -> dict:
-    """
-    Collect all ItemData values under a FormData element into a flat dict.
-    Keys are human-readable labels (from item_labels) or the raw OID.
-    """
     data: dict = {}
-
-    for ig in form_elem.iter(_tag("ItemGroupData")):
-        for item in ig.findall(_tag("ItemData")):
+    for ig in _iterlocal(form_elem, "ItemGroupData"):
+        for item in _findall(ig, "ItemData"):
             oid   = _attr(item, "ItemOID") or ""
             value = _attr(item, "Value")
             if oid and value is not None:
                 label       = item_labels.get(oid, oid)
                 data[label] = value
-
-    # Also capture repeat key if present (useful for repeating forms like AE)
-    ig_repeat = form_elem.find(_tag("ItemGroupData"))
-    if ig_repeat is not None:
-        rk = _attr(ig_repeat, "ItemGroupRepeatKey")
+        rk = _attr(ig, "ItemGroupRepeatKey")
         if rk:
             data["_repeat_key"] = rk
-
     return data
 
 
 # ---------------------------------------------------------------------------
-# Main parse + ingest function
+# Main parse + ingest
 # ---------------------------------------------------------------------------
 
 def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
     """
     Parse CDISC ODM XML bytes and upsert into clinical tables.
-
-    Returns:
-        {
-          "study": study_oid,
-          "subjects": int,
-          "visits": int,
-          "forms": int,
-          "warnings": [str, ...]
-        }
+    Uses local-name matching throughout — works regardless of namespace
+    declarations in the source file (standard ODM, Rave transactional, etc.).
     """
-    warnings: list[str] = []
+    import logging
+    log = logging.getLogger("odm_parser")
 
-    # ── Parse XML ──────────────────────────────────────────────────────────
+    warnings: list = []
+
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
         raise ValueError(f"Invalid XML: {exc}") from exc
 
-    # Strip default namespace from tag comparisons by normalising the root tag
-    # (ElementTree includes namespace in curly braces)
-    odm_ns = NS_ODM
-    if root.tag == "ODM":
-        # No namespace declared — common in some exports
-        odm_ns = ""
+    log.warning("ODM root tag: %s", root.tag)
+    all_cd = list(_iterlocal(root, "ClinicalData"))
+    log.warning("ClinicalData blocks found: %d", len(all_cd))
+    if all_cd:
+        first_sd = list(_findall(all_cd[0], "SubjectData"))
+        log.warning("SubjectData in first ClinicalData: %d  (children: %s)",
+                    len(first_sd),
+                    [_local(c.tag) for c in all_cd[0]])
 
-    def tag(local: str) -> str:
-        return f"{{{odm_ns}}}{local}" if odm_ns else local
-
-    # ── Find Study element (optional — absent in ClinicalAuditRecords format) ─
-    study_elem = root.find(tag("Study"))
-    if study_elem is None:
-        study_elem = root.find("Study")
+    # ── Study metadata ──────────────────────────────────────────────────────
+    study_elem = _find(root, "Study")
 
     if study_elem is not None:
         form_labels, item_labels = _build_label_maps(study_elem)
         study_meta               = _extract_study_meta(study_elem)
     else:
-        # ClinicalAuditRecords / transactional ODM — derive study OID from
-        # the first <ClinicalData StudyOID="..."> attribute
-        form_labels  = {}
-        item_labels  = {}
-        cd_elem      = root.find(tag("ClinicalData"))
-        if cd_elem is None:
-            cd_elem  = root.find("ClinicalData")
+        form_labels = {}
+        item_labels = {}
+        cd_elem = next(_iterlocal(root, "ClinicalData"), None)
         if cd_elem is None:
             raise ValueError(
                 "No <Study> or <ClinicalData> element found. "
@@ -319,36 +298,24 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
 
     study_id = study_obj.id
 
-    # ── ClinicalData sections ──────────────────────────────────────────────
-    subjects_count = 0
-    visits_count   = 0
-    forms_count    = 0
+    # ── Walk ClinicalData → SubjectData → StudyEventData → FormData ────────
+    subjects_new    = 0
+    subjects_seen   = set()   # track unique keys processed this run
+    visits_count    = 0
+    forms_count     = 0
 
-    for clinical_data in root.iter(tag("ClinicalData")):
-        for subject_elem in clinical_data.findall(tag("SubjectData")):
+    for clinical_data in _iterlocal(root, "ClinicalData"):
+        for subject_elem in _findall(clinical_data, "SubjectData"):
 
-            # Subject key
-            subject_key = (
-                _attr(subject_elem, "SubjectKey")
-                or _attr(subject_elem, "SubjectKey", ns=NS_MDSOL)
-                or "UNKNOWN"
-            )
+            subject_key = _attr(subject_elem, "SubjectKey") or "UNKNOWN"
 
-            # Site reference
-            site_ref  = subject_elem.find(tag("SiteRef"))
+            site_ref  = _find(subject_elem, "SiteRef")
             site_id   = _attr(site_ref, "LocationOID") if site_ref is not None else None
-            site_name = site_id  # fallback; Rave sometimes puts name in OID
+            site_name = site_id
 
-            # Demographics from ItemData
-            demo = _extract_demographics(subject_elem, item_labels)
+            demo   = _extract_demographics(subject_elem, item_labels)
+            status = _attr(subject_elem, "SubjectStatus") or "Enrolled"
 
-            # Status heuristic
-            status = "Enrolled"
-            status_raw = _attr(subject_elem, "mdsol:SubjectStatus") or ""
-            if status_raw:
-                status = status_raw
-
-            # Upsert subject
             subj_obj = (
                 db.query(ClinicalSubject)
                 .filter(
@@ -359,16 +326,16 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
             )
             if not subj_obj:
                 subj_obj = ClinicalSubject(
-                    study_id        = study_id,
-                    subject_key     = subject_key,
-                    site_id         = site_id,
-                    site_name       = site_name,
-                    status          = status,
+                    study_id    = study_id,
+                    subject_key = subject_key,
+                    site_id     = site_id,
+                    site_name   = site_name,
+                    status      = status,
                     **{k: v for k, v in demo.items() if v is not None},
                 )
                 db.add(subj_obj)
                 db.flush()
-                subjects_count += 1
+                subjects_new += 1
             else:
                 if site_id:
                     subj_obj.site_id   = site_id
@@ -378,27 +345,25 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
                         setattr(subj_obj, k, v)
                 db.flush()
 
+            subjects_seen.add(subject_key)
+
             subject_id = subj_obj.id
 
-            # ── Visits (StudyEventData) ────────────────────────────────────
-            for event_elem in subject_elem.findall(tag("StudyEventData")):
+            for event_elem in _findall(subject_elem, "StudyEventData"):
                 visit_oid  = _attr(event_elem, "StudyEventOID") or "VISIT"
                 repeat_key = _attr(event_elem, "StudyEventRepeatKey") or "1"
                 visit_name = (
-                    _attr(event_elem, "mdsol:InstanceName")
-                    or _attr(event_elem, f"{{{NS_MDSOL}}}InstanceName")
+                    _attr(event_elem, "InstanceName")   # mdsol extension
                     or visit_oid
                 )
 
-                # Derive visit date from any date-looking ItemData in this event
                 visit_date: Optional[date] = None
-                for item in event_elem.iter(tag("ItemData")):
+                for item in _iterlocal(event_elem, "ItemData"):
                     val = _attr(item, "Value") or ""
                     if re.match(r"\d{4}-\d{2}-\d{2}", val):
                         visit_date = _parse_date(val)
                         break
 
-                # Unique key: subject + visit OID + repeat key
                 unique_visit_oid = f"{visit_oid}_{repeat_key}"
 
                 visit_obj = (
@@ -428,14 +393,13 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
 
                 visit_id = visit_obj.id
 
-                # ── Forms (FormData) ───────────────────────────────────────
-                for form_elem in event_elem.findall(tag("FormData")):
+                for form_elem in _findall(event_elem, "FormData"):
                     form_oid  = _attr(form_elem, "FormOID") or "FORM"
                     form_name = form_labels.get(form_oid, form_oid)
                     form_data = _extract_form_data(form_elem, item_labels)
 
                     if not form_data:
-                        continue  # skip empty forms
+                        continue
 
                     form_obj = (
                         db.query(ClinicalForm)
@@ -455,7 +419,6 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
                         db.add(form_obj)
                         forms_count += 1
                     else:
-                        # Merge new fields into existing data_json
                         existing = json.loads(form_obj.data_json or "{}")
                         existing.update(form_data)
                         form_obj.data_json = json.dumps(existing)
@@ -465,7 +428,7 @@ def parse_and_ingest(xml_bytes: bytes, db: Session) -> dict:
 
     return {
         "study":    study_meta["study_oid"],
-        "subjects": subjects_count,
+        "subjects": len(subjects_seen),   # total unique subjects processed
         "visits":   visits_count,
         "forms":    forms_count,
         "warnings": warnings,
