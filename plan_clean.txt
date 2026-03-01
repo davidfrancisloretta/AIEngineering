@@ -1,0 +1,1629 @@
+I now have a complete picture of the codebase. Here is the full, detailed implementation plan.
+
+---
+
+# Clinical Trial RAG Implementation Plan
+
+## Codebase Summary (What Was Found)
+
+Before the plan, here is what the existing architecture actually looks like so you can see exactly where each new piece slots in:
+
+- `backend/app/db.py` - creates `engine` and `SessionLocal` from `DATABASE_URL` env var
+- `backend/app/models.py` - `Base = declarative_base()`, four models: `CampaignMetrics`, `User`, `ApiConfig`, `RaveTransaction`
+- `backend/app/main.py` - FastAPI lifespan calls `Base.metadata.create_all(bind=engine)` then `_seed_demo_user()`, includes five routers
+- `backend/migrations/env.py` - imports `Base` from `models`, uses `DATABASE_URL` env override, standard Alembic online/offline mode
+- `backend/migrations/versions/` - two migrations: `001` (campaign_metrics), `002` (users, api_configs, rave_transactions)
+- `frontend/app.py` - `st.navigation` with two groups: "Analytics" (Dashboard, Fetch_Data) and "Account" (Settings)
+- `frontend/utils/api.py` - `ApiClient` class with 13 methods, all using `requests` against `API_BASE`
+- Service pattern: thin router -> service function -> SQLAlchemy session; routers use `Depends(get_db)` and `Depends(get_current_user)`
+
+---
+
+## 1. Complete File Map: New vs Modified
+
+### New Files - Backend
+
+```
+backend/app/models_clinical.py          # 5 new SQLAlchemy models for clinical data + DocumentChunk
+backend/app/schemas_clinical.py         # Pydantic schemas for all clinical + RAG endpoints
+backend/app/routers/clinical.py         # /clinical/* endpoints (subjects, visits, forms, seed)
+backend/app/routers/rag.py              # /rag/chat and /rag/ingest endpoints
+backend/app/services/clinical_demo.py   # Demo data generator (replaces Rave demo pattern)
+backend/app/services/rave_client.py     # Stub for future rwslib/live Rave connection
+backend/app/services/llm.py             # Ollama HTTP client (embed + generate)
+backend/app/services/rag.py             # RAG pipeline: embed -> pgvector search -> prompt -> generate
+backend/app/services/ingestion.py       # Chunk builder: turns clinical rows into text chunks
+backend/migrations/versions/003_pgvector_and_clinical.py  # Migration: enable extension + new tables
+```
+
+### New Files - Frontend
+
+```
+frontend/pages/Clinical_Trials.py       # Clinical data viewer page (subjects, visits, lab table)
+frontend/pages/RAG_Chat.py              # Chat interface page
+```
+
+### Modified Files
+
+```
+docker-compose.yml                      # Add ollama service + healthcheck + volume
+backend/requirements.txt                # Add pgvector, httpx (async already present sync-only)
+backend/app/main.py                     # Import + include clinical and rag routers; extend lifespan
+frontend/app.py                         # Add two pages to navigation under "Clinical Trials" group
+frontend/utils/api.py                   # Add clinical data methods + RAG chat method
+```
+
+---
+
+## 2. New SQLAlchemy Models
+
+File: `backend/app/models_clinical.py`
+
+The existing `models.py` uses `from sqlalchemy.ext.declarative import declarative_base` and defines a module-level `Base`. The new models must share the same `Base` object so `Base.metadata.create_all` picks them all up. The cleanest approach is to move `Base` into a separate `backend/app/base.py` module and import it in both files, then import both model files in `main.py`. Alternatively, import `Base` from `models` in `models_clinical.py`.
+
+```python
+# backend/app/models_clinical.py
+
+from datetime import datetime, timezone
+from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Boolean
+from sqlalchemy.orm import relationship
+from models import Base  # reuse same declarative Base
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+class ClinicalStudy(Base):
+    __tablename__ = "clinical_studies"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    study_oid       = Column(String, unique=True, index=True, nullable=False)  # e.g. "CARDIO-2024"
+    protocol_name   = Column(String, nullable=False)
+    phase           = Column(String)           # "Phase III"
+    sponsor         = Column(String)
+    therapeutic_area = Column(String)
+    objective       = Column(Text)
+    status          = Column(String, default="Active")  # Active | Completed | Terminated
+    created_at      = Column(DateTime, default=_now)
+
+    subjects = relationship("ClinicalSubject", back_populates="study")
+
+
+class ClinicalSubject(Base):
+    __tablename__ = "clinical_subjects"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    study_id        = Column(Integer, ForeignKey("clinical_studies.id"), nullable=False)
+    subject_key     = Column(String, index=True, nullable=False)  # "CARDIO-2024-001-001"
+    site_id         = Column(String)            # "SITE-001"
+    site_name       = Column(String)            # "London Cardiology Centre"
+    age             = Column(Integer)
+    sex             = Column(String)            # M | F
+    race            = Column(String)
+    enrollment_date = Column(Date)
+    status          = Column(String, default="Enrolled")  # Enrolled | Completed | Withdrawn
+    created_at      = Column(DateTime, default=_now)
+
+    study    = relationship("ClinicalStudy", back_populates="subjects")
+    visits   = relationship("ClinicalVisit", back_populates="subject")
+
+
+class ClinicalVisit(Base):
+    __tablename__ = "clinical_visits"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    subject_id      = Column(Integer, ForeignKey("clinical_subjects.id"), nullable=False)
+    visit_oid       = Column(String)            # "SCREENING", "DAY1", etc.
+    visit_name      = Column(String)            # human label
+    visit_date      = Column(Date)
+    status          = Column(String, default="Completed")  # Completed | Missed | Pending
+    created_at      = Column(DateTime, default=_now)
+
+    subject = relationship("ClinicalSubject", back_populates="visits")
+    forms   = relationship("ClinicalForm", back_populates="visit")
+
+
+class ClinicalForm(Base):
+    __tablename__ = "clinical_forms"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    visit_id        = Column(Integer, ForeignKey("clinical_visits.id"), nullable=False)
+    form_oid        = Column(String)            # "VS", "AE", "CM", "LB"
+    form_name       = Column(String)            # "Vital Signs", "Adverse Events", etc.
+    data_json       = Column(Text)              # JSON blob of all item/value pairs
+    created_at      = Column(DateTime, default=_now)
+
+    visit = relationship("ClinicalVisit", back_populates="forms")
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    source_type   = Column(String, index=True)  # "study" | "subject" | "visit" | "adverse_event" | "lab"
+    source_id     = Column(Integer, index=True)  # FK to relevant table row id (informational, no DB FK)
+    chunk_text    = Column(Text, nullable=False)
+    # Vector stored as Text in SQLAlchemy; raw SQL used for pgvector operations
+    embedding     = Column(Text)                # placeholder; actual column type set via raw DDL in migration
+    metadata_json = Column(Text)               # JSON: {"study_oid": ..., "subject_key": ..., ...}
+    created_at    = Column(DateTime, default=_now)
+```
+
+The `embedding` column needs the pgvector type `vector(768)`. SQLAlchemy does not know this type natively, so the migration creates the column via raw SQL rather than `sa.Column`. The Python model maps it as `Text` for ORM-level access but queries use `func` and raw SQL strings for similarity search.
+
+---
+
+## 3. New API Endpoints
+
+### Router: `backend/app/routers/clinical.py`
+
+```
+GET   /clinical/studies                        -> list all studies
+GET   /clinical/studies/{study_id}             -> study detail
+GET   /clinical/subjects?study_id=&site_id=   -> list subjects (filterable)
+GET   /clinical/subjects/{subject_id}          -> subject detail with visit summary
+GET   /clinical/visits?subject_id=            -> visits for a subject
+GET   /clinical/forms/{visit_id}               -> all forms for a visit
+POST  /clinical/seed                           -> generate full demo dataset (auth required)
+DELETE /clinical/seed                          -> clear all clinical demo data (auth required)
+```
+
+All `GET` endpoints require `Depends(get_current_user)` to stay consistent with the existing pattern. The `seed` endpoint mirrors the `POST /demo/seed` pattern in `routers/demo.py`.
+
+### Router: `backend/app/routers/rag.py`
+
+```
+POST  /rag/chat                                -> main RAG query endpoint (auth required)
+POST  /rag/ingest                              -> trigger (re)ingestion of clinical data (auth required)
+GET   /rag/status                              -> check Ollama connectivity + chunk count (auth required)
+```
+
+The `POST /rag/chat` body:
+```json
+{
+  "question": "string",
+  "top_k": 5         (optional, default 5)
+}
+```
+
+Response:
+```json
+{
+  "answer": "string",
+  "sources": [
+    {"chunk_text": "string", "source_type": "string", "source_id": 1, "similarity": 0.87}
+  ],
+  "model": "tinyllama"
+}
+```
+
+The `POST /rag/ingest` response:
+```json
+{
+  "chunks_created": 142,
+  "message": "Ingestion complete"
+}
+```
+
+---
+
+## 4. Service Layer Design
+
+### `backend/app/services/llm.py`
+
+Thin synchronous HTTP wrapper around the Ollama REST API. Uses the existing `requests` library (already in requirements) to keep the pattern synchronous like all other services.
+
+```python
+import os, requests, json
+
+OLLAMA_BASE = os.getenv("OLLAMA_URL", "http://ollama:11434")
+EMBED_MODEL  = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+LLM_MODEL    = os.getenv("OLLAMA_LLM_MODEL", "tinyllama")
+
+
+def embed_text(text: str) -> list[float]:
+    """
+    Call POST /api/embeddings on Ollama.
+    Returns list[float] of length 768.
+    Raises requests.HTTPError on failure.
+    """
+    resp = requests.post(
+        f"{OLLAMA_BASE}/api/embeddings",
+        json={"model": EMBED_MODEL, "prompt": text},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]  # list[float]
+
+
+def generate_text(prompt: str, system: str = "") -> str:
+    """
+    Call POST /api/generate on Ollama (non-streaming).
+    Returns the generated string.
+    """
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": prompt,
+        "stream": False,
+    }
+    if system:
+        payload["system"] = system
+    resp = requests.post(
+        f"{OLLAMA_BASE}/api/generate",
+        json=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()["response"]
+
+
+def ollama_ready() -> bool:
+    """Health-check: returns True if Ollama is reachable."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5)
+        return resp.ok
+    except Exception:
+        return False
+```
+
+### `backend/app/services/ingestion.py`
+
+Builds text chunks from the clinical database, calls `llm.embed_text`, stores results in `document_chunks`. This is called by the `/rag/ingest` endpoint.
+
+```python
+import json
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from models_clinical import ClinicalStudy, ClinicalSubject, ClinicalVisit, ClinicalForm, DocumentChunk
+from services.llm import embed_text
+
+
+def _vector_literal(embedding: list[float]) -> str:
+    """Format a Python list as a pgvector literal '[0.1,0.2,...]'."""
+    return "[" + ",".join(str(v) for v in embedding) + "]"
+
+
+def _upsert_chunk(db: Session, source_type: str, source_id: int,
+                  chunk_text: str, metadata: dict) -> None:
+    """Embed and insert a single chunk. Deletes existing chunk for same source first."""
+    db.query(DocumentChunk).filter(
+        DocumentChunk.source_type == source_type,
+        DocumentChunk.source_id == source_id,
+    ).delete()
+
+    vector = embed_text(chunk_text)
+    vector_str = _vector_literal(vector)
+    metadata_json = json.dumps(metadata)
+
+    # Use raw SQL for vector insert because SQLAlchemy doesn't know vector type
+    db.execute(text(
+        """
+        INSERT INTO document_chunks (source_type, source_id, chunk_text, embedding, metadata_json, created_at)
+        VALUES (:source_type, :source_id, :chunk_text, CAST(:embedding AS vector), :metadata_json, NOW())
+        """
+    ), {
+        "source_type": source_type,
+        "source_id": source_id,
+        "chunk_text": chunk_text,
+        "embedding": vector_str,
+        "metadata_json": metadata_json,
+    })
+
+
+def ingest_all(db: Session) -> int:
+    """
+    Build all text chunks from the clinical database and embed them.
+    Returns total chunks created.
+    """
+    count = 0
+    studies = db.query(ClinicalStudy).all()
+
+    for study in studies:
+        # Chunk 1: Study summary
+        text_study = (
+            f"Study: {study.study_oid}. Protocol: {study.protocol_name}. "
+            f"Phase: {study.phase}. Sponsor: {study.sponsor}. "
+            f"Therapeutic area: {study.therapeutic_area}. "
+            f"Objective: {study.objective}. Status: {study.status}."
+        )
+        _upsert_chunk(db, "study", study.id, text_study,
+                      {"study_oid": study.study_oid})
+        count += 1
+
+        subjects = db.query(ClinicalSubject).filter(
+            ClinicalSubject.study_id == study.id
+        ).all()
+
+        for subj in subjects:
+            # Chunk 2: Subject summary
+            text_subj = (
+                f"Subject {subj.subject_key} enrolled in study {study.study_oid}. "
+                f"Site: {subj.site_name} ({subj.site_id}). "
+                f"Age: {subj.age}, Sex: {subj.sex}, Race: {subj.race}. "
+                f"Enrollment date: {subj.enrollment_date}. Status: {subj.status}."
+            )
+            _upsert_chunk(db, "subject", subj.id, text_subj,
+                          {"study_oid": study.study_oid, "subject_key": subj.subject_key})
+            count += 1
+
+            visits = db.query(ClinicalVisit).filter(
+                ClinicalVisit.subject_id == subj.id
+            ).all()
+
+            for visit in visits:
+                forms = db.query(ClinicalForm).filter(
+                    ClinicalForm.visit_id == visit.id
+                ).all()
+                form_data = {f.form_oid: json.loads(f.data_json) for f in forms if f.data_json}
+
+                # Chunk 3: Visit summary (vital signs + key metrics)
+                vs = form_data.get("VS", {})
+                text_visit = (
+                    f"Subject {subj.subject_key}, visit {visit.visit_name} "
+                    f"on {visit.visit_date}. Status: {visit.status}. "
+                )
+                if vs:
+                    text_visit += (
+                        f"Vital signs: HR {vs.get('heart_rate')} bpm, "
+                        f"BP {vs.get('systolic_bp')}/{vs.get('diastolic_bp')} mmHg, "
+                        f"Temp {vs.get('temperature')} C, Weight {vs.get('weight')} kg."
+                    )
+                _upsert_chunk(db, "visit", visit.id, text_visit,
+                              {"study_oid": study.study_oid,
+                               "subject_key": subj.subject_key,
+                               "visit_name": visit.visit_name})
+                count += 1
+
+                # Chunk 4: Adverse events (one chunk per AE in the visit)
+                ae_list = form_data.get("AE", {}).get("events", [])
+                for ae in ae_list:
+                    text_ae = (
+                        f"Adverse event for subject {subj.subject_key} at visit "
+                        f"{visit.visit_name}: {ae.get('term')}. "
+                        f"Severity: {ae.get('severity')}. "
+                        f"Relationship to study drug: {ae.get('relationship')}. "
+                        f"Outcome: {ae.get('outcome')}."
+                    )
+                    _upsert_chunk(db, "adverse_event", visit.id, text_ae,
+                                  {"study_oid": study.study_oid,
+                                   "subject_key": subj.subject_key,
+                                   "visit_name": visit.visit_name,
+                                   "ae_term": ae.get("term")})
+                    count += 1
+
+                # Chunk 5: Abnormal lab results
+                lb_results = form_data.get("LB", {}).get("results", [])
+                abnormal = [r for r in lb_results if r.get("flag") in ("H", "L", "HH", "LL")]
+                if abnormal:
+                    lab_lines = ", ".join(
+                        f"{r['test']} {r['value']} {r['unit']} ({r['flag']})"
+                        for r in abnormal
+                    )
+                    text_lab = (
+                        f"Abnormal lab results for subject {subj.subject_key} "
+                        f"at visit {visit.visit_name}: {lab_lines}."
+                    )
+                    _upsert_chunk(db, "lab", visit.id, text_lab,
+                                  {"study_oid": study.study_oid,
+                                   "subject_key": subj.subject_key,
+                                   "visit_name": visit.visit_name})
+                    count += 1
+
+    db.commit()
+    return count
+```
+
+### `backend/app/services/rag.py`
+
+Implements the retrieval + generation pipeline.
+
+```python
+import json
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from services.llm import embed_text, generate_text
+
+
+SYSTEM_PROMPT = """You are a clinical trial data assistant for the CARDIO-2024 Phase III study.
+Answer questions accurately based only on the context provided.
+If the context does not contain enough information, say so clearly.
+Do not invent data. Use clinical terminology appropriately."""
+
+
+def retrieve_chunks(db: Session, question: str, top_k: int = 5) -> list[dict]:
+    """
+    Embed the question and run a cosine similarity search via pgvector.
+    Returns list of dicts with chunk_text, source_type, source_id, similarity.
+    """
+    q_vector = embed_text(question)
+    vector_str = "[" + ",".join(str(v) for v in q_vector) + "]"
+
+    rows = db.execute(text(
+        """
+        SELECT id, source_type, source_id, chunk_text, metadata_json,
+               1 - (embedding <=> CAST(:q_vec AS vector)) AS similarity
+        FROM document_chunks
+        ORDER BY embedding <=> CAST(:q_vec AS vector)
+        LIMIT :top_k
+        """
+    ), {"q_vec": vector_str, "top_k": top_k}).fetchall()
+
+    return [
+        {
+            "chunk_text": row.chunk_text,
+            "source_type": row.source_type,
+            "source_id": row.source_id,
+            "metadata": json.loads(row.metadata_json) if row.metadata_json else {},
+            "similarity": float(row.similarity),
+        }
+        for row in rows
+    ]
+
+
+def build_prompt(question: str, chunks: list[dict]) -> str:
+    """Assemble the LLM prompt with retrieved context."""
+    context_lines = []
+    for i, chunk in enumerate(chunks, start=1):
+        context_lines.append(f"[Source {i} - {chunk['source_type']}]\n{chunk['chunk_text']}")
+
+    context_block = "\n\n".join(context_lines)
+    return (
+        f"Context:\n{context_block}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer based strictly on the context above:"
+    )
+
+
+def answer_question(db: Session, question: str, top_k: int = 5) -> dict:
+    """
+    Full RAG pipeline:
+      1. Embed question
+      2. pgvector cosine search (top_k chunks)
+      3. Build prompt
+      4. Ollama LLM generate
+      5. Return answer + sources
+    """
+    chunks = retrieve_chunks(db, question, top_k=top_k)
+    if not chunks:
+        return {
+            "answer": "No relevant clinical data found. Please run data ingestion first.",
+            "sources": [],
+            "model": "tinyllama",
+        }
+
+    prompt = build_prompt(question, chunks)
+    answer = generate_text(prompt, system=SYSTEM_PROMPT)
+
+    sources = [
+        {
+            "chunk_text": c["chunk_text"],
+            "source_type": c["source_type"],
+            "source_id": c["source_id"],
+            "similarity": c["similarity"],
+        }
+        for c in chunks
+    ]
+
+    return {"answer": answer, "sources": sources, "model": "tinyllama"}
+```
+
+### `backend/app/services/clinical_demo.py`
+
+Generates realistic CDISC ODM-structured demo data. Follows the same seed/deterministic pattern as the existing `services/demo.py`.
+
+```python
+"""
+Generates realistic CARDIO-2024 Phase III clinical trial demo data.
+Structure: Study -> Subjects -> Visits -> Forms -> Items
+All data is deterministic (seeded RNG) so re-seeding is idempotent.
+"""
+import json
+import random
+from datetime import date, timedelta
+
+from sqlalchemy.orm import Session
+from models_clinical import ClinicalStudy, ClinicalSubject, ClinicalVisit, ClinicalForm
+
+
+STUDY_DEF = {
+    "study_oid":        "CARDIO-2024",
+    "protocol_name":    "A Phase III Randomized Double-Blind Study of CardioMax vs Placebo "
+                        "in Patients with Moderate-to-Severe Heart Failure",
+    "phase":            "Phase III",
+    "sponsor":          "CardioPharm International",
+    "therapeutic_area": "Cardiovascular",
+    "objective":        "To evaluate the efficacy and safety of CardioMax 50mg once daily "
+                        "in reducing MACE events over 52 weeks compared to placebo.",
+    "status":           "Active",
+}
+
+SITES = [
+    ("SITE-001", "London Cardiology Centre"),
+    ("SITE-002", "Manchester Heart Institute"),
+    ("SITE-003", "Edinburgh Royal Infirmary"),
+]
+
+VISITS = [
+    ("SCREENING",   "Screening",          -14),
+    ("DAY1",        "Day 1 (Baseline)",     0),
+    ("WEEK4",       "Week 4",              28),
+    ("WEEK12",      "Week 12",             84),
+    ("EOT",         "End of Treatment",   364),
+]
+
+SUBJECT_STATUSES = [("Enrolled", 75), ("Completed", 15), ("Withdrawn", 10)]
+AE_TERMS = [
+    ("Headache", "Mild",   "Unlikely",  "Resolved"),
+    ("Nausea",   "Mild",   "Possible",  "Resolved"),
+    ("Dizziness","Moderate","Probable", "Resolved"),
+    ("Fatigue",  "Mild",   "Unlikely",  "Ongoing"),
+    ("Dyspnoea", "Moderate","Possible", "Resolved"),
+    ("Oedema",   "Severe", "Probable",  "Resolved"),
+    ("Palpitations","Mild","Unlikely",  "Resolved"),
+]
+
+LAB_TESTS = [
+    ("HGB",  "Haemoglobin",         "g/dL",  11.0, 17.5),
+    ("WBC",  "White Blood Count",   "10^9/L", 4.0, 11.0),
+    ("PLT",  "Platelets",           "10^9/L", 150, 400),
+    ("CREAT","Creatinine",          "umol/L", 62,  115),
+    ("CHOL", "Cholesterol",         "mmol/L", 3.5,  6.5),
+    ("BNP",  "BNP",                 "pg/mL",  0,   100),
+    ("TROP", "Troponin I",          "ng/L",   0,    14),
+]
+
+RACES = ["White", "Black or African American", "Asian", "Mixed", "Other"]
+
+
+def _weighted(rng: random.Random, options: list[tuple]) -> str:
+    population = [item for item, weight in options for _ in range(weight)]
+    return rng.choice(population)
+
+
+def _generate_vitals(rng: random.Random, visit_num: int) -> dict:
+    """Vital signs with slight progression over trial."""
+    base_hr  = rng.randint(60, 100)
+    base_sys = rng.randint(110, 150)
+    base_dia = rng.randint(70, 95)
+    return {
+        "heart_rate":    base_hr + rng.randint(-5, 5),
+        "systolic_bp":   base_sys - visit_num * rng.randint(0, 3),
+        "diastolic_bp":  base_dia - visit_num * rng.randint(0, 2),
+        "temperature":   round(36.2 + rng.uniform(0, 1.2), 1),
+        "weight":        round(rng.uniform(58, 105), 1),
+        "height":        rng.randint(155, 190),
+    }
+
+
+def _generate_labs(rng: random.Random) -> dict:
+    """Lab panel with occasional abnormal values (20% chance per analyte)."""
+    results = []
+    for code, name, unit, lo, hi in LAB_TESTS:
+        # 80% in range, 20% out of range
+        if rng.random() < 0.8:
+            value = round(rng.uniform(lo, hi), 2)
+            flag = "N"
+        elif rng.random() < 0.5:
+            value = round(rng.uniform(hi, hi * 1.4), 2)
+            flag = "HH" if value > hi * 1.3 else "H"
+        else:
+            value = round(rng.uniform(lo * 0.6, lo), 2)
+            flag = "LL" if value < lo * 0.7 else "L"
+        results.append({"test": code, "name": name, "value": value, "unit": unit, "flag": flag})
+    return {"results": results}
+
+
+def _generate_aes(rng: random.Random, visit_num: int) -> dict:
+    """0-2 adverse events per visit, more likely in later visits."""
+    n_ae = rng.choices([0, 1, 2], weights=[70, 20, 10])[0]
+    if visit_num == 0:  # Screening: no AEs
+        n_ae = 0
+    events = []
+    for _ in range(n_ae):
+        term, sev, rel, outcome = rng.choice(AE_TERMS)
+        events.append({
+            "term": term, "severity": sev,
+            "relationship": rel, "outcome": outcome,
+        })
+    return {"events": events}
+
+
+def _generate_meds(rng: random.Random) -> dict:
+    """Concomitant medications."""
+    meds = rng.sample([
+        "Aspirin 75mg", "Bisoprolol 5mg", "Ramipril 10mg",
+        "Atorvastatin 40mg", "Furosemide 40mg", "Spironolactone 25mg",
+        "Metformin 500mg", "Amlodipine 5mg",
+    ], k=rng.randint(0, 4))
+    return {"medications": meds}
+
+
+def seed_clinical_study(db: Session, seed: int = 42) -> dict:
+    """
+    Generate and persist the full CARDIO-2024 demo dataset.
+    Clears existing clinical data first (idempotent).
+    Returns summary counts.
+    """
+    rng = random.Random(seed)
+
+    # Clear existing
+    db.query(ClinicalForm).delete()
+    db.query(ClinicalVisit).delete()
+    db.query(ClinicalSubject).delete()
+    db.query(ClinicalStudy).delete()
+    db.commit()
+
+    # Create study
+    study = ClinicalStudy(**STUDY_DEF)
+    db.add(study)
+    db.flush()  # get study.id
+
+    enrollment_start = date(2024, 1, 15)
+    subject_count = 0
+    visit_count = 0
+    form_count = 0
+
+    for i in range(20):
+        site_id, site_name = rng.choice(SITES)
+        enroll_offset = rng.randint(0, 120)
+        enroll_date = enrollment_start + timedelta(days=enroll_offset)
+        sex = rng.choice(["M", "F"])
+        subj_status = _weighted(rng, SUBJECT_STATUSES)
+
+        subject = ClinicalSubject(
+            study_id=study.id,
+            subject_key=f"CARDIO-2024-{i+1:03d}",
+            site_id=site_id,
+            site_name=site_name,
+            age=rng.randint(45, 80),
+            sex=sex,
+            race=rng.choice(RACES),
+            enrollment_date=enroll_date,
+            status=subj_status,
+        )
+        db.add(subject)
+        db.flush()
+        subject_count += 1
+
+        n_visits = len(VISITS) if subj_status == "Completed" else rng.randint(2, 5)
+
+        for v_idx, (v_oid, v_name, v_day_offset) in enumerate(VISITS[:n_visits]):
+            visit_date = enroll_date + timedelta(days=v_day_offset)
+            visit = ClinicalVisit(
+                subject_id=subject.id,
+                visit_oid=v_oid,
+                visit_name=v_name,
+                visit_date=visit_date,
+                status="Completed",
+            )
+            db.add(visit)
+            db.flush()
+            visit_count += 1
+
+            # Form: Vital Signs
+            db.add(ClinicalForm(
+                visit_id=visit.id, form_oid="VS", form_name="Vital Signs",
+                data_json=json.dumps(_generate_vitals(rng, v_idx))
+            ))
+            # Form: Adverse Events
+            db.add(ClinicalForm(
+                visit_id=visit.id, form_oid="AE", form_name="Adverse Events",
+                data_json=json.dumps(_generate_aes(rng, v_idx))
+            ))
+            # Form: Concomitant Medications
+            db.add(ClinicalForm(
+                visit_id=visit.id, form_oid="CM", form_name="Concomitant Medications",
+                data_json=json.dumps(_generate_meds(rng))
+            ))
+            # Form: Lab Results
+            db.add(ClinicalForm(
+                visit_id=visit.id, form_oid="LB", form_name="Lab Results",
+                data_json=json.dumps(_generate_labs(rng))
+            ))
+            form_count += 4
+
+    db.commit()
+    return {
+        "study": study.study_oid,
+        "subjects": subject_count,
+        "visits": visit_count,
+        "forms": form_count,
+    }
+```
+
+### `backend/app/services/rave_client.py`
+
+Stub for future live Medidata Rave connection via rwslib.
+
+```python
+"""
+Stub client for live Medidata Rave Web Services connection.
+Currently unused — demo data is generated by clinical_demo.py.
+Replace with rwslib calls when live connection is needed.
+
+Future implementation using rwslib:
+    from rwslib import RWSConnection
+    from rwslib.rws_requests import StudyListRequest, FormDataRequest
+
+    conn = RWSConnection(base_url, username, password)
+    studies = conn.send_request(StudyListRequest())
+"""
+from typing import Optional
+
+
+class RaveClientConfig:
+    def __init__(self, base_url: str, username: str, password: str,
+                 virtual_directory: str = "RaveWebServices"):
+        self.base_url = base_url
+        self.username = username
+        self.password = password
+        self.virtual_directory = virtual_directory
+
+
+def fetch_study_list(config: RaveClientConfig) -> list[dict]:
+    """Placeholder: fetch list of studies from Rave."""
+    raise NotImplementedError("Live Rave connection not yet configured. Use demo data.")
+
+
+def fetch_subjects(config: RaveClientConfig, study_oid: str,
+                   environment: str = "Prod") -> list[dict]:
+    """Placeholder: fetch subjects for a study from Rave."""
+    raise NotImplementedError("Live Rave connection not yet configured. Use demo data.")
+
+
+def fetch_clinical_data(config: RaveClientConfig, study_oid: str,
+                        subject_key: Optional[str] = None) -> dict:
+    """Placeholder: fetch full ODM clinical data from Rave."""
+    raise NotImplementedError("Live Rave connection not yet configured. Use demo data.")
+```
+
+---
+
+## 5. Alembic Migration: `003_pgvector_and_clinical.py`
+
+This is the most critical migration. It must:
+1. Enable the pgvector extension
+2. Create four clinical tables
+3. Create `document_chunks` with a `vector(768)` column (raw DDL)
+4. Create the IVFFlat index for cosine similarity search
+
+```python
+"""Enable pgvector extension and create clinical trial + RAG tables
+
+Revision ID: 003
+Revises: 002
+Create Date: 2026-02-26
+"""
+from typing import Sequence, Union
+from alembic import op
+import sqlalchemy as sa
+
+revision: str = "003"
+down_revision: Union[str, None] = "002"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # 1. Enable pgvector extension
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    # 2. clinical_studies
+    op.create_table(
+        "clinical_studies",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("study_oid", sa.String, nullable=False),
+        sa.Column("protocol_name", sa.String, nullable=False),
+        sa.Column("phase", sa.String),
+        sa.Column("sponsor", sa.String),
+        sa.Column("therapeutic_area", sa.String),
+        sa.Column("objective", sa.Text),
+        sa.Column("status", sa.String, server_default="Active"),
+        sa.Column("created_at", sa.DateTime),
+    )
+    op.create_index("ix_clinical_studies_id", "clinical_studies", ["id"])
+    op.create_index("ix_clinical_studies_study_oid", "clinical_studies", ["study_oid"], unique=True)
+
+    # 3. clinical_subjects
+    op.create_table(
+        "clinical_subjects",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("study_id", sa.Integer, sa.ForeignKey("clinical_studies.id"), nullable=False),
+        sa.Column("subject_key", sa.String, nullable=False),
+        sa.Column("site_id", sa.String),
+        sa.Column("site_name", sa.String),
+        sa.Column("age", sa.Integer),
+        sa.Column("sex", sa.String),
+        sa.Column("race", sa.String),
+        sa.Column("enrollment_date", sa.Date),
+        sa.Column("status", sa.String, server_default="Enrolled"),
+        sa.Column("created_at", sa.DateTime),
+    )
+    op.create_index("ix_clinical_subjects_id", "clinical_subjects", ["id"])
+    op.create_index("ix_clinical_subjects_subject_key", "clinical_subjects", ["subject_key"])
+
+    # 4. clinical_visits
+    op.create_table(
+        "clinical_visits",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("subject_id", sa.Integer, sa.ForeignKey("clinical_subjects.id"), nullable=False),
+        sa.Column("visit_oid", sa.String),
+        sa.Column("visit_name", sa.String),
+        sa.Column("visit_date", sa.Date),
+        sa.Column("status", sa.String, server_default="Completed"),
+        sa.Column("created_at", sa.DateTime),
+    )
+    op.create_index("ix_clinical_visits_id", "clinical_visits", ["id"])
+
+    # 5. clinical_forms
+    op.create_table(
+        "clinical_forms",
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("visit_id", sa.Integer, sa.ForeignKey("clinical_visits.id"), nullable=False),
+        sa.Column("form_oid", sa.String),
+        sa.Column("form_name", sa.String),
+        sa.Column("data_json", sa.Text),
+        sa.Column("created_at", sa.DateTime),
+    )
+    op.create_index("ix_clinical_forms_id", "clinical_forms", ["id"])
+
+    # 6. document_chunks — use raw DDL for vector(768) column
+    op.execute("""
+        CREATE TABLE document_chunks (
+            id            SERIAL PRIMARY KEY,
+            source_type   VARCHAR NOT NULL,
+            source_id     INTEGER NOT NULL,
+            chunk_text    TEXT NOT NULL,
+            embedding     vector(768),
+            metadata_json TEXT,
+            created_at    TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    op.create_index("ix_document_chunks_source_type", "document_chunks", ["source_type"])
+    op.create_index("ix_document_chunks_source_id", "document_chunks", ["source_id"])
+
+    # 7. IVFFlat index for cosine distance — requires at least 100 rows first, so use HNSW instead
+    # HNSW is available in pgvector >= 0.5.0 and works with 0 rows
+    op.execute("""
+        CREATE INDEX ix_document_chunks_embedding_hnsw
+        ON document_chunks
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
+    """)
+
+
+def downgrade() -> None:
+    op.execute("DROP TABLE IF EXISTS document_chunks")
+    op.drop_table("clinical_forms")
+    op.drop_table("clinical_visits")
+    op.drop_table("clinical_subjects")
+    op.drop_table("clinical_studies")
+    op.execute("DROP EXTENSION IF EXISTS vector")
+```
+
+Note: The migration uses HNSW (Hierarchical Navigable Small World) index rather than IVFFlat because HNSW works on an empty table and does not require a training step. IVFFlat requires at least `lists * 40` rows to be present. Since this table starts empty, HNSW is the correct choice. pgvector >= 0.5.0 supports HNSW, and the `pgvector/pgvector:pg15` Docker image ships 0.7.0+.
+
+---
+
+## 6. Router Implementations
+
+### `backend/app/routers/clinical.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from dependencies import get_db, get_current_user
+from models import User
+from models_clinical import ClinicalStudy, ClinicalSubject, ClinicalVisit, ClinicalForm
+from schemas_clinical import (
+    StudyResponse, SubjectResponse, SubjectDetailResponse,
+    VisitResponse, FormResponse, ClinicalSeedResponse
+)
+from services.clinical_demo import seed_clinical_study
+
+router = APIRouter(prefix="/clinical", tags=["clinical"])
+
+
+@router.post("/seed", response_model=ClinicalSeedResponse)
+def seed_clinical_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate full CARDIO-2024 demo dataset."""
+    result = seed_clinical_study(db)
+    return result
+
+
+@router.delete("/seed", status_code=204)
+def clear_clinical_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove all clinical demo data."""
+    db.query(ClinicalForm).delete()
+    db.query(ClinicalVisit).delete()
+    db.query(ClinicalSubject).delete()
+    db.query(ClinicalStudy).delete()
+    db.commit()
+
+
+@router.get("/studies", response_model=list[StudyResponse])
+def list_studies(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return db.query(ClinicalStudy).all()
+
+
+@router.get("/subjects", response_model=list[SubjectResponse])
+def list_subjects(
+    study_id: int | None = None,
+    site_id: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = db.query(ClinicalSubject)
+    if study_id:
+        q = q.filter(ClinicalSubject.study_id == study_id)
+    if site_id:
+        q = q.filter(ClinicalSubject.site_id == site_id)
+    return q.order_by(ClinicalSubject.subject_key).all()
+
+
+@router.get("/subjects/{subject_id}", response_model=SubjectDetailResponse)
+def get_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    subj = db.query(ClinicalSubject).filter(ClinicalSubject.id == subject_id).first()
+    if not subj:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    return subj
+
+
+@router.get("/visits", response_model=list[VisitResponse])
+def list_visits(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return (
+        db.query(ClinicalVisit)
+        .filter(ClinicalVisit.subject_id == subject_id)
+        .order_by(ClinicalVisit.visit_date)
+        .all()
+    )
+
+
+@router.get("/forms/{visit_id}", response_model=list[FormResponse])
+def list_forms(
+    visit_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return db.query(ClinicalForm).filter(ClinicalForm.visit_id == visit_id).all()
+```
+
+### `backend/app/routers/rag.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from dependencies import get_db, get_current_user
+from models import User
+from models_clinical import DocumentChunk
+from schemas_clinical import RAGChatRequest, RAGChatResponse, RAGStatusResponse, RAGIngestResponse
+from services import rag as rag_service
+from services import ingestion as ingestion_service
+from services.llm import ollama_ready
+
+router = APIRouter(prefix="/rag", tags=["rag"])
+
+
+@router.get("/status", response_model=RAGStatusResponse)
+def rag_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    chunk_count = db.query(DocumentChunk).count()
+    return {
+        "ollama_ready": ollama_ready(),
+        "chunk_count": chunk_count,
+        "embed_model": "nomic-embed-text",
+        "llm_model": "tinyllama",
+    }
+
+
+@router.post("/ingest", response_model=RAGIngestResponse)
+def ingest_clinical_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not ollama_ready():
+        raise HTTPException(status_code=503, detail="Ollama service not available")
+    count = ingestion_service.ingest_all(db)
+    return {"chunks_created": count, "message": f"Ingestion complete: {count} chunks embedded"}
+
+
+@router.post("/chat", response_model=RAGChatResponse)
+def chat(
+    body: RAGChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not ollama_ready():
+        raise HTTPException(status_code=503, detail="Ollama service not available")
+    result = rag_service.answer_question(db, body.question, top_k=body.top_k)
+    return result
+```
+
+---
+
+## 7. Pydantic Schemas: `backend/app/schemas_clinical.py`
+
+```python
+from datetime import date, datetime
+from pydantic import BaseModel
+
+
+class StudyResponse(BaseModel):
+    id: int
+    study_oid: str
+    protocol_name: str
+    phase: str | None
+    sponsor: str | None
+    therapeutic_area: str | None
+    status: str | None
+    class Config:
+        from_attributes = True
+
+
+class SubjectResponse(BaseModel):
+    id: int
+    study_id: int
+    subject_key: str
+    site_id: str | None
+    site_name: str | None
+    age: int | None
+    sex: str | None
+    race: str | None
+    enrollment_date: date | None
+    status: str | None
+    class Config:
+        from_attributes = True
+
+
+class SubjectDetailResponse(SubjectResponse):
+    # Visits are loaded lazily; the endpoint returns the subject
+    # and the frontend calls /clinical/visits?subject_id= separately
+    pass
+
+
+class VisitResponse(BaseModel):
+    id: int
+    subject_id: int
+    visit_oid: str | None
+    visit_name: str | None
+    visit_date: date | None
+    status: str | None
+    class Config:
+        from_attributes = True
+
+
+class FormResponse(BaseModel):
+    id: int
+    visit_id: int
+    form_oid: str | None
+    form_name: str | None
+    data_json: str | None
+    class Config:
+        from_attributes = True
+
+
+class ClinicalSeedResponse(BaseModel):
+    study: str
+    subjects: int
+    visits: int
+    forms: int
+
+
+class RAGChatRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+class RAGSourceChunk(BaseModel):
+    chunk_text: str
+    source_type: str
+    source_id: int
+    similarity: float
+
+
+class RAGChatResponse(BaseModel):
+    answer: str
+    sources: list[RAGSourceChunk]
+    model: str
+
+
+class RAGIngestResponse(BaseModel):
+    chunks_created: int
+    message: str
+
+
+class RAGStatusResponse(BaseModel):
+    ollama_ready: bool
+    chunk_count: int
+    embed_model: str
+    llm_model: str
+```
+
+---
+
+## 8. Modified `backend/app/main.py`
+
+The two new routers need to be imported and registered. The lifespan also needs to import `models_clinical` so `Base.metadata.create_all` includes the new tables (important for local dev where Alembic may not have run yet).
+
+```python
+# Add these imports at top of main.py
+from routers import clinical as clinical_router_module
+from routers import rag as rag_router_module
+import models_clinical  # noqa: F401 — ensures models are registered with Base.metadata
+
+# Add these two lines alongside the existing app.include_router calls
+app.include_router(clinical_router_module.router)
+app.include_router(rag_router_module.router)
+```
+
+The existing lifespan pattern (`Base.metadata.create_all(bind=engine)`) will automatically pick up the new tables because `models_clinical` is now imported and its classes reference the same `Base` object.
+
+---
+
+## 9. Docker Compose Changes
+
+The updated `docker-compose.yml` adds the Ollama service, adjusts the `db` service to use the pgvector-enabled image, and adds the `OLLAMA_URL` env var to the backend.
+
+```yaml
+services:
+  backend:
+    build: ./backend
+    container_name: ai_backend
+    depends_on:
+      - db
+      - ollama
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/analytics
+      - SECRET_KEY=super-secret-jwt-key-change-in-production-32chars!
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_EMBED_MODEL=nomic-embed-text
+      - OLLAMA_LLM_MODEL=tinyllama
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    container_name: ai_frontend
+    depends_on:
+      - backend
+    environment:
+      - API_URL=http://backend:8000
+    ports:
+      - "8501:8501"
+
+  db:
+    image: pgvector/pgvector:pg15        # replaces postgres:15 — ships pgvector extension
+    container_name: analytics_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: analytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        sleep 5 &&
+        ollama pull nomic-embed-text &&
+        ollama pull tinyllama &&
+        wait
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  pg_data:
+  ollama_data:
+```
+
+Key decisions:
+- `pgvector/pgvector:pg15` is the official image published by the pgvector project; it is identical to `postgres:15` but ships with the extension pre-compiled. No custom Dockerfile needed for the db container.
+- The Ollama `entrypoint` uses a background `ollama serve` + `sleep 5` + model pulls approach. The `sleep 5` gives the server time to initialize before issuing pull commands. Both models are pulled at container start; if already in the volume they are no-ops.
+- `pg_data` volume is added to persist database data across container restarts (was missing in the original compose).
+- The backend now `depends_on: ollama` so Docker Compose starts Ollama first, though the backend code uses `ollama_ready()` checks to gracefully handle Ollama not yet being ready.
+
+---
+
+## 10. Requirements Additions
+
+### `backend/requirements.txt` — additions
+
+```
+pgvector          # SQLAlchemy type support (optional but useful for future typed queries)
+httpx             # Already implied by testing; keep for async future use
+```
+
+The `pgvector` Python package provides `Vector` type for SQLAlchemy if you want typed ORM access. Since the plan uses raw SQL for vector operations, it is not strictly required but is good to include for future development. The `requests` library (already present) handles all Ollama HTTP calls synchronously.
+
+### `frontend/requirements.txt` — no additions required
+
+The frontend only calls the backend API via `requests` (already present). No direct Ollama or pgvector dependency is needed on the frontend.
+
+---
+
+## 11. Frontend: New Streamlit Pages
+
+### Updated `frontend/app.py`
+
+```python
+# The navigation dict gains a new "Clinical Trials" group
+pg = st.navigation(
+    {
+        "Analytics": [
+            st.Page("pages/Dashboard.py", title="Dashboard", icon=""),
+            st.Page("pages/Fetch_Data.py", title="Fetch Data", icon=""),
+        ],
+        "Clinical Trials": [
+            st.Page("pages/Clinical_Trials.py", title="Trial Data", icon=""),
+            st.Page("pages/RAG_Chat.py", title="RAG Chat", icon=""),
+        ],
+        "Account": [
+            st.Page("pages/Settings.py", title="Settings", icon=""),
+        ],
+    }
+)
+```
+
+### `frontend/pages/Clinical_Trials.py`
+
+Structure mirrors `Dashboard.py`: auth guard -> ApiClient -> tabs.
+
+```
+Tab 1: Study Overview
+  - st.metric cards: subjects enrolled, visits completed, forms collected, AE count
+  - st.dataframe: subjects table (subject_key, site, age, sex, status, enrollment_date)
+  - Sidebar filter: site dropdown, status dropdown
+
+Tab 2: Subject Detail
+  - st.selectbox to pick a subject
+  - Visit timeline: st.dataframe with visit names, dates, status
+  - Per-visit form expander:
+      VS: HR, BP, Weight rendered as st.metric
+      AE: table of adverse events
+      LB: lab table with flag column colour-coded (H/L = amber, HH/LL = red)
+      CM: medication list
+
+Tab 3: Adverse Events
+  - Aggregate AE table across all subjects
+  - Plotly bar chart: AE term by severity
+  - Plotly pie: AE relationship distribution
+
+Tab 4: Lab Results
+  - Subject x Test heatmap of abnormal counts
+  - Filterable dataframe of all lab results with flag
+
+Actions sidebar:
+  - "Seed Demo Data" button -> POST /clinical/seed
+  - "Clear Demo Data" button -> DELETE /clinical/seed
+  - "Ingest for RAG" button -> POST /rag/ingest (shows chunk count feedback)
+```
+
+### `frontend/pages/RAG_Chat.py`
+
+```
+Layout: two-column (3:1 ratio)
+
+Left column (chat area):
+  - st.header "Clinical Trial RAG Chat"
+  - st.info showing Ollama status (GET /rag/status)
+  - Chat history stored in st.session_state["rag_history"] as list[dict(role, content)]
+  - Render history with st.chat_message("user"/"assistant")
+  - st.chat_input at bottom: on submit -> POST /rag/chat -> append to history
+
+Right column (sources panel):
+  - After each answer, show the source chunks used
+  - Each source in an st.expander with similarity score and source_type badge
+  - "Clear chat" button
+
+State management:
+  - st.session_state["rag_history"] = []
+  - st.session_state["last_sources"] = []
+```
+
+### New Methods in `frontend/utils/api.py`
+
+```python
+# Clinical trial data
+def seed_clinical_data(self) -> dict:
+    resp = requests.post(f"{API_BASE}/clinical/seed", headers=self._headers, timeout=30)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def clear_clinical_data(self) -> None:
+    resp = requests.delete(f"{API_BASE}/clinical/seed", headers=self._headers)
+    if not resp.ok:
+        _raise(resp)
+
+def get_studies(self) -> list:
+    resp = requests.get(f"{API_BASE}/clinical/studies", headers=self._headers)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def get_subjects(self, study_id: int | None = None, site_id: str | None = None) -> list:
+    params = {}
+    if study_id:
+        params["study_id"] = study_id
+    if site_id:
+        params["site_id"] = site_id
+    resp = requests.get(f"{API_BASE}/clinical/subjects", headers=self._headers, params=params)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def get_visits(self, subject_id: int) -> list:
+    resp = requests.get(f"{API_BASE}/clinical/visits",
+                        headers=self._headers, params={"subject_id": subject_id})
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def get_forms(self, visit_id: int) -> list:
+    resp = requests.get(f"{API_BASE}/clinical/forms/{visit_id}", headers=self._headers)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+# RAG
+def rag_status(self) -> dict:
+    resp = requests.get(f"{API_BASE}/rag/status", headers=self._headers, timeout=10)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def rag_ingest(self) -> dict:
+    resp = requests.post(f"{API_BASE}/rag/ingest", headers=self._headers, timeout=300)
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+
+def rag_chat(self, question: str, top_k: int = 5) -> dict:
+    resp = requests.post(
+        f"{API_BASE}/rag/chat",
+        json={"question": question, "top_k": top_k},
+        headers=self._headers,
+        timeout=120,
+    )
+    if not resp.ok:
+        _raise(resp)
+    return resp.json()
+```
+
+---
+
+## 12. Migration Strategy and Sequencing
+
+The implementation must follow this exact order because each step depends on the previous:
+
+**Step 1: Docker Compose update**
+
+Change `db` image from `postgres:15` to `pgvector/pgvector:pg15`. This is required before any migration can run because the migration executes `CREATE EXTENSION IF NOT EXISTS vector`. The pgvector-enabled image ships the shared library; the standard postgres:15 image does not.
+
+Add the `ollama` service and `volumes` block. Rebuild with `docker compose down && docker compose up --build`.
+
+**Step 2: Migration 003**
+
+Run `alembic upgrade head` inside the backend container. This creates the four clinical tables and `document_chunks` with its `vector(768)` column. The migration is safe to run against an existing database with data in `users`, `rave_transactions`, etc. because it only adds new tables.
+
+The `env.py` is already correctly configured to read `DATABASE_URL` from the environment, so no changes are needed there.
+
+**Step 3: New model files**
+
+Add `models_clinical.py` and `schemas_clinical.py`. Update `main.py` to import them and include the two new routers.
+
+**Step 4: New service files**
+
+Add `llm.py`, `ingestion.py`, `rag.py`, `clinical_demo.py`, `rave_client.py` to `backend/app/services/`.
+
+**Step 5: New router files**
+
+Add `clinical.py` and `rag.py` to `backend/app/routers/`.
+
+**Step 6: Frontend**
+
+Update `app.py` navigation. Add `Clinical_Trials.py` and `RAG_Chat.py`. Add methods to `utils/api.py`.
+
+**Step 7: Model pull verification**
+
+Wait for Ollama container healthcheck to pass. Verify models are available:
+```bash
+docker exec ai_ollama ollama list
+```
+Should show `nomic-embed-text` and `tinyllama`.
+
+**Step 8: Data ingestion**
+
+In the Streamlit UI (Clinical Trials page), click "Seed Demo Data" to populate the clinical tables, then click "Ingest for RAG" to embed all chunks. Or via curl:
+```bash
+curl -X POST http://localhost:8000/clinical/seed -H "Authorization: Bearer <token>"
+curl -X POST http://localhost:8000/rag/ingest -H "Authorization: Bearer <token>"
+```
+
+---
+
+## 13. Embedding Generation and Storage: Data Flow at Ingestion Time
+
+```
+POST /rag/ingest
+  |
+  v
+routers/rag.py::ingest()
+  - checks ollama_ready()
+  - calls ingestion_service.ingest_all(db)
+  |
+  v
+services/ingestion.py::ingest_all(db)
+  - queries ClinicalStudy -> ClinicalSubject -> ClinicalVisit -> ClinicalForm
+  - for each entity type, calls _upsert_chunk(db, source_type, source_id, text, metadata)
+  |
+  v
+services/ingestion.py::_upsert_chunk()
+  1. DELETE existing document_chunks WHERE source_type=X AND source_id=Y
+  2. calls llm.embed_text(chunk_text)
+  |
+  v
+services/llm.py::embed_text()
+  - POST http://ollama:11434/api/embeddings
+  - body: {"model": "nomic-embed-text", "prompt": chunk_text}
+  - returns list[float] of length 768
+  |
+  v (back in _upsert_chunk)
+  3. formats vector as "[0.123,0.456,...]"
+  4. db.execute(raw SQL INSERT with CAST(:embedding AS vector))
+  5. row stored in document_chunks with embedding column as vector(768) type in Postgres
+  |
+  v
+db.commit() after all chunks for the current entity
+```
+
+Chunk volumes for the full 20-subject CARDIO-2024 demo:
+- 1 study chunk = 1
+- 20 subject chunks = 20
+- ~75 visits x 1 visit summary chunk = ~75
+- ~75 visits x (0-2) AE chunks avg ~1.2 = ~90
+- ~75 visits x (0-1) abnormal lab chunks at 20% rate = ~15
+- **Total: ~200 chunks, ~200 Ollama embedding calls**
+
+Each `nomic-embed-text` embedding call takes approximately 50-200ms on CPU. Total ingestion time: 10-40 seconds on CPU Ollama.
+
+---
+
+## 14. RAG Retrieval: Data Flow at Query Time
+
+```
+POST /rag/chat  {"question": "Which subjects had severe adverse events?", "top_k": 5}
+  |
+  v
+routers/rag.py::chat()
+  - checks ollama_ready()
+  - calls rag_service.answer_question(db, question, top_k=5)
+  |
+  v
+services/rag.py::answer_question()
+  calls retrieve_chunks(db, question, top_k=5)
+  |
+  v
+services/rag.py::retrieve_chunks()
+  1. calls llm.embed_text(question)
+     - POST http://ollama:11434/api/embeddings
+     - returns 768-dim question vector
+  2. formats as "[0.1,0.2,...]"
+  3. db.execute(raw SQL):
+     SELECT ... 1 - (embedding <=> CAST(:q_vec AS vector)) AS similarity
+     FROM document_chunks
+     ORDER BY embedding <=> CAST(:q_vec AS vector)    -- cosine distance, HNSW index used
+     LIMIT 5
+  4. returns list of 5 most relevant chunks with similarity scores
+  |
+  v (back in answer_question)
+  calls build_prompt(question, chunks)
+  - assembles prompt: [Source 1 - adverse_event]\n<chunk_text>\n\n ... \n\nQuestion: ...\n\nAnswer:
+  |
+  v
+  calls llm.generate_text(prompt, system=SYSTEM_PROMPT)
+  - POST http://ollama:11434/api/generate
+  - body: {"model": "tinyllama", "prompt": "...", "stream": false, "system": "..."}
+  - returns generated string (typically 2-5 seconds on CPU)
+  |
+  v
+returns {
+  "answer": "Subjects CARDIO-2024-007 and CARDIO-2024-015 experienced severe adverse events...",
+  "sources": [
+    {"chunk_text": "Adverse event for subject CARDIO-2024-007...", "source_type": "adverse_event",
+     "source_id": 23, "similarity": 0.94},
+    ...
+  ],
+  "model": "tinyllama"
+}
+```
+
+The `<=>` operator is pgvector's cosine distance operator. `1 - (embedding <=> q_vec)` converts distance to similarity score (0 to 1, higher is more similar). The HNSW index means this query is ANN (approximate nearest neighbor) rather than exact KNN, but for 200 chunks the difference is negligible and the index still provides a performance floor for when the corpus grows.
+
+---
+
+## 15. Integration Points with Existing Code — Summary Table
+
+| Existing Component | What Changes | Why |
+|---|---|---|
+| `backend/app/models.py` | No changes; `Base` imported from it in `models_clinical.py` | Preserves existing models |
+| `backend/app/main.py` | Import `models_clinical`, include 2 new routers | New endpoints must be registered |
+| `backend/app/db.py` | No changes | Same engine/session used everywhere |
+| `backend/app/dependencies.py` | No changes | `get_db` and `get_current_user` reused directly |
+| `docker-compose.yml` | Change db image, add ollama service + volumes | pgvector extension + LLM |
+| `backend/requirements.txt` | Add `pgvector` | Optional but clean |
+| `frontend/app.py` | Add "Clinical Trials" navigation group | Two new pages |
+| `frontend/utils/api.py` | Add 8 new methods to existing `ApiClient` class | Frontend needs to call new endpoints |
+| `backend/migrations/versions/` | Add `003_pgvector_and_clinical.py` | Schema changes via Alembic |
+
+---
+
+## 16. Anticipated Challenges and Mitigations
+
+**Challenge 1: `Base` circular import between `models.py` and `models_clinical.py`**
+
+`models_clinical.py` does `from models import Base`. This is safe as long as `models.py` does not import from `models_clinical.py`. The import is one-directional. In `main.py`, import `models_clinical` after `models` is already imported.
+
+**Challenge 2: Ollama model download time on first startup**
+
+`nomic-embed-text` is ~274MB and `tinyllama` is ~638MB. The Docker `entrypoint` script pulls both at container start, which can take several minutes. The backend's `ollama_ready()` check and the `/rag/status` endpoint allow the frontend to show a "warming up" state rather than an error. The healthcheck `start_period: 120s` gives Ollama time to initialize before other containers consider it healthy.
+
+**Challenge 3: pgvector extension not present on existing `postgres:15` container**
+
+Changing the image to `pgvector/pgvector:pg15` will re-initialize the database if no volume is mounted. The original `docker-compose.yml` has no volume for `pg_data`, meaning the database is lost on every `docker compose down`. The new compose adds a named volume `pg_data:` which also means any existing data in the ephemeral container is gone on rebuild — but this is acceptable since it was ephemeral anyway.
+
+**Challenge 4: Raw SQL for vector operations bypasses ORM type safety**
+
+All vector insert/query operations use `db.execute(text(...))`. Parameter names must be spelled consistently. Use the exact parameter approach shown: `CAST(:embedding AS vector)` in the SQL string with a plain string value `"[0.1,0.2,...]"` passed as the parameter.
+
+**Challenge 5: Ingest timeout from browser perspective**
+
+The `/rag/ingest` endpoint is synchronous and will run for 10-40 seconds for 200 chunks. The `frontend` uses `requests.post(..., timeout=300)` (5 minutes). A Streamlit spinner wraps the call. For very large datasets in the future, this should be made async with a job queue, but for the 200-chunk demo it is acceptable as a synchronous call.
+
+---
+
+### Critical Files for Implementation
+
+- `c:/Users/David Francis/ai-docker-app/backend/app/models.py` - The `Base = declarative_base()` object defined here must be shared into `models_clinical.py`; this is the anchor for all ORM models
+- `c:/Users/David Francis/ai-docker-app/backend/app/main.py` - The lifespan and router registration point; must import `models_clinical` and include the two new routers for the feature to exist
+- `c:/Users/David Francis/ai-docker-app/backend/migrations/versions/002_add_auth_and_rave.py` - The migration to chain from (`down_revision: "002"`); migration 003 must reference this correctly
+- `c:/Users/David Francis/ai-docker-app/docker-compose.yml` - The db image swap and Ollama service addition; nothing works without this change because pgvector extension must be available before migration 003 can run
+- `c:/Users/David Francis/ai-docker-app/frontend/utils/api.py` - The `ApiClient` class that all frontend pages use; the 8 new methods slot in alongside existing ones following the exact same `requests` + `_raise` pattern
