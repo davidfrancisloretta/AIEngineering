@@ -144,7 +144,8 @@ with tab_sql:
     st.markdown(
         "Ask questions in plain English. Instead of vector similarity search, "
         "the AI writes SQL directly against your structured clinical database and explains the results. "
-        "Uses **llama3.2:3b** — no embeddings, no vector index, exact answers."
+        "Uses **llama3.2:3b** — no embeddings, no vector index, exact answers. "
+        "**Follow-up questions work** — the AI remembers the last 3 exchanges."
     )
 
     # Model status
@@ -152,7 +153,7 @@ with tab_sql:
         status = client.rag_status()
         sql_ready = status.get("ollama_ready", False)
         if sql_ready:
-            st.info("Model: `llama3.2:3b`  ·  Direct SQL against PostgreSQL")
+            st.info("Model: `llama3.2:3b`  ·  Direct SQL against PostgreSQL  ·  HealerAgent enabled")
         else:
             st.warning("⏳ Ollama still loading — llama3.2:3b may not be ready yet.")
     except ApiError:
@@ -165,28 +166,35 @@ with tab_sql:
     sql_suggestions = [
         "How many subjects are in each site?",
         "Show me all subjects enrolled at site 003.",
-        "What form data was recorded for subject initials 'abc'?",
         "Which subjects have more than 2 visits?",
+        "List subjects with severe adverse events.",
         "List all unique form types in the database.",
     ]
     sql_cols = st.columns(len(sql_suggestions))
     for i, suggestion in enumerate(sql_suggestions):
         if sql_cols[i].button(suggestion, use_container_width=True, key=f"sql_sug_{i}"):
+            # Build history for memory context (exclude rows/columns — too large)
+            history_payload = [
+                {"role": m["role"], "content": m["content"], "sql": m.get("sql", "")}
+                for m in st.session_state["sql_history"]
+            ]
             st.session_state["sql_history"].append({"role": "user", "content": suggestion})
             with st.spinner("Generating SQL and querying database…"):
                 try:
-                    result = client.rag_sql_query(suggestion)
+                    result = client.rag_sql_query(suggestion, history=history_payload)
                     st.session_state["sql_history"].append({
-                        "role":    "assistant",
-                        "content": result["answer"],
-                        "sql":     result["sql"],
-                        "columns": result["columns"],
-                        "rows":    result["rows"],
-                        "count":   result["row_count"],
+                        "role":         "assistant",
+                        "content":      result["answer"],
+                        "sql":          result["sql"],
+                        "columns":      result["columns"],
+                        "rows":         result["rows"],
+                        "count":        result["row_count"],
+                        "heal_attempts": result.get("heal_attempts", 0),
                     })
                 except ApiError as e:
                     st.session_state["sql_history"].append(
-                        {"role": "assistant", "content": f"Error: {e}", "sql": "", "columns": [], "rows": [], "count": 0}
+                        {"role": "assistant", "content": f"Error: {e}", "sql": "",
+                         "columns": [], "rows": [], "count": 0, "heal_attempts": 0}
                     )
             st.rerun()
 
@@ -197,7 +205,11 @@ with tab_sql:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant" and msg.get("sql"):
-                with st.expander(f"🔍 Generated SQL  ·  {msg.get('count', 0)} rows returned"):
+                heal = msg.get("heal_attempts", 0)
+                heal_badge = f"  ·  🔧 healed {heal}x" if heal > 0 else ""
+                with st.expander(
+                    f"🔍 Generated SQL  ·  {msg.get('count', 0)} rows returned{heal_badge}"
+                ):
                     st.code(msg["sql"], language="sql")
                     if msg.get("columns") and msg.get("rows"):
                         df = pd.DataFrame(msg["rows"], columns=msg["columns"])
@@ -205,10 +217,15 @@ with tab_sql:
 
     # Chat input
     sql_question = st.chat_input(
-        "Ask a data question — e.g. 'How many subjects per site?'",
+        "Ask a data question — follow-ups work, e.g. 'now show only the severe ones'",
         key="sql_input",
     )
     if sql_question:
+        # Snapshot history before appending the new user message
+        history_payload = [
+            {"role": m["role"], "content": m["content"], "sql": m.get("sql", "")}
+            for m in st.session_state["sql_history"]
+        ]
         st.session_state["sql_history"].append({"role": "user", "content": sql_question})
         with st.chat_message("user"):
             st.markdown(sql_question)
@@ -216,34 +233,38 @@ with tab_sql:
         with st.chat_message("assistant"):
             with st.spinner("Generating SQL and querying database…"):
                 try:
-                    result = client.rag_sql_query(sql_question)
-                    answer  = result["answer"]
-                    sql_out = result["sql"]
-                    columns = result["columns"]
-                    rows    = result["rows"]
-                    count   = result["row_count"]
+                    result       = client.rag_sql_query(sql_question, history=history_payload)
+                    answer       = result["answer"]
+                    sql_out      = result["sql"]
+                    columns      = result["columns"]
+                    rows         = result["rows"]
+                    count        = result["row_count"]
+                    heal_attempts = result.get("heal_attempts", 0)
                 except ApiError as e:
-                    answer  = f"Error: {e}"
-                    sql_out = ""
-                    columns = []
-                    rows    = []
-                    count   = 0
+                    answer        = f"Error: {e}"
+                    sql_out       = ""
+                    columns       = []
+                    rows          = []
+                    count         = 0
+                    heal_attempts = 0
 
             st.markdown(answer)
             if sql_out:
-                with st.expander(f"🔍 Generated SQL  ·  {count} rows returned"):
+                heal_badge = f"  ·  🔧 healed {heal_attempts}x" if heal_attempts > 0 else ""
+                with st.expander(f"🔍 Generated SQL  ·  {count} rows returned{heal_badge}"):
                     st.code(sql_out, language="sql")
                     if columns and rows:
                         df = pd.DataFrame(rows, columns=columns)
                         st.dataframe(df, use_container_width=True, hide_index=True)
 
             st.session_state["sql_history"].append({
-                "role":    "assistant",
-                "content": answer,
-                "sql":     sql_out,
-                "columns": columns,
-                "rows":    rows,
-                "count":   count,
+                "role":          "assistant",
+                "content":       answer,
+                "sql":           sql_out,
+                "columns":       columns,
+                "rows":          rows,
+                "count":         count,
+                "heal_attempts": heal_attempts,
             })
         st.rerun()
 

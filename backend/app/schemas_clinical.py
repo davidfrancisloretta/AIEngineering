@@ -111,17 +111,25 @@ class RAGStatusResponse(BaseModel):
 
 # ── Text-to-SQL ────────────────────────────────────────────────────────────────
 
+class ConversationMessage(BaseModel):
+    role:    str        # "user" or "assistant"
+    content: str
+    sql:     str = ""   # the SQL that was executed for this turn (if any)
+
+
 class SQLQueryRequest(BaseModel):
     question: str
+    history:  list[ConversationMessage] = []
 
 
 class SQLQueryResponse(BaseModel):
-    answer:    str
-    sql:       str
-    columns:   list[str]
-    rows:      list[list]
-    row_count: int
-    model:     str
+    answer:        str
+    sql:           str
+    columns:       list[str]
+    rows:          list[list]
+    row_count:     int
+    model:         str
+    heal_attempts: int = 0
 
 
 # ── ODM Upload ──────────────────────────────────────────────────────────────

@@ -212,10 +212,10 @@ class ApiClient:
     # --------------------------------------------------
     # Text-to-SQL
     # --------------------------------------------------
-    def rag_sql_query(self, question: str) -> dict:
+    def rag_sql_query(self, question: str, history: list[dict] | None = None) -> dict:
         resp = requests.post(
             f"{API_BASE}/rag/sql-query",
-            json={"question": question},
+            json={"question": question, "history": history or []},
             headers=self._headers,
             timeout=180,
         )

@@ -89,10 +89,12 @@ def sql_query(
     """
     Answer a clinical trial question using Text-to-SQL:
     question → llama3.2:3b generates SQL → execute → LLM summarises → answer + raw data.
-    No embeddings or vector search required.
+    Supports conversation history for follow-up questions.
+    HealerAgent automatically retries broken SQL up to 3 times.
     """
+    history = [msg.model_dump() for msg in body.history] if body.history else []
     try:
-        result = text_to_sql_service.sql_chat(db, body.question)
+        result = text_to_sql_service.sql_chat(db, body.question, history=history)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:

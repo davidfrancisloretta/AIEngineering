@@ -3,14 +3,15 @@ Text-to-SQL service for clinical trial data.
 
 Pipeline:
   1. Build schema context (tables + views description)
-  2. Send question + schema to llama3.2:3b → generate SQL
-  3. Extract and safety-validate SQL (SELECT only)
-  4. Execute SQL against PostgreSQL
-  5. Send question + results back to LLM → natural language answer
+  2. Inject conversation history into prompt (memory)
+  3. Send question + schema to llama3.2:3b → generate SQL
+  4. Extract and safety-validate SQL (SELECT only)
+  5. Execute SQL against PostgreSQL
+     → on failure: HealerAgent re-prompts with the error up to 3 times
+  6. Send question + results back to LLM → natural language answer
 """
 import os
 import re
-import json
 import logging
 
 import requests
@@ -19,9 +20,10 @@ from sqlalchemy.orm import Session
 
 log = logging.getLogger("text_to_sql")
 
-OLLAMA_BASE = os.getenv("OLLAMA_URL", "http://ollama:11434")
-SQL_MODEL   = os.getenv("OLLAMA_SQL_MODEL", "llama3.2:3b")
-MAX_ROWS    = 100
+OLLAMA_BASE       = os.getenv("OLLAMA_URL", "http://ollama:11434")
+SQL_MODEL         = os.getenv("OLLAMA_SQL_MODEL", "llama3.2:3b")
+MAX_ROWS          = 100
+MAX_HEAL_ATTEMPTS = 3   # HealerAgent: max retries on SQL execution error
 
 
 # ── SQL Views ──────────────────────────────────────────────────────────────────
@@ -165,6 +167,33 @@ def ensure_views(db: Session) -> None:
         log.error("Failed to create views: %s", exc)
 
 
+# ── Conversation memory ────────────────────────────────────────────────────────
+
+def _build_memory_context(history: list[dict]) -> str:
+    """
+    Format the last 3 exchanges (6 messages) from conversation history
+    into a compact context block for injection into the SQL generation prompt.
+
+    Each history entry is expected to have:
+      {"role": "user"|"assistant", "content": str, "sql": str (optional)}
+    """
+    if not history:
+        return ""
+
+    recent = history[-6:]  # last 3 user+assistant pairs
+    lines = ["--- Previous conversation ---"]
+    for msg in recent:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = msg.get("content", "")
+        sql = msg.get("sql", "")
+        if sql:
+            lines.append(f"{role}: {content}\n  [SQL used: {sql}]")
+        else:
+            lines.append(f"{role}: {content}")
+    lines.append("--- End of previous conversation ---")
+    return "\n".join(lines)
+
+
 # ── SQL extraction from LLM response ──────────────────────────────────────────
 
 def _extract_sql(response: str) -> str:
@@ -229,20 +258,52 @@ def _model_ready() -> bool:
         return False
 
 
+# ── HealerAgent ────────────────────────────────────────────────────────────────
+
+def _heal_sql(broken_sql: str, db_error: str, question: str) -> str:
+    """
+    HealerAgent: given a broken SQL statement and the database error it produced,
+    ask the LLM to fix it. Returns the corrected SQL (not yet validated).
+    """
+    heal_prompt = (
+        f"The following PostgreSQL query failed with an error.\n\n"
+        f"Error message:\n{db_error}\n\n"
+        f"Broken SQL:\n{broken_sql}\n\n"
+        f"Original question: {question}\n\n"
+        f"Database schema:\n{_SCHEMA_CONTEXT}\n\n"
+        "Fixed SQL query:"
+    )
+    heal_system = (
+        "You are a PostgreSQL expert. A SQL query has failed. "
+        "Fix the error and output ONLY the corrected SQL SELECT statement. "
+        "No explanations, no markdown, just the fixed SQL."
+    )
+    log.info("HealerAgent: re-prompting LLM to fix SQL error: %s", db_error[:200])
+    raw = _ollama_generate(heal_prompt, system=heal_system)
+    return _extract_sql(raw)
+
+
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
-def sql_chat(db: Session, question: str) -> dict:
+def sql_chat(db: Session, question: str, history: list[dict] | None = None) -> dict:
     """
-    Full Text-to-SQL pipeline.
+    Full Text-to-SQL pipeline with HealerAgent and conversation memory.
+
+    Args:
+      db:       SQLAlchemy session
+      question: User's natural language question
+      history:  Optional list of previous conversation turns, each:
+                {"role": "user"|"assistant", "content": str, "sql": str}
 
     Returns:
       {
-        "answer":  str,          # natural language answer
-        "sql":     str,          # generated SQL
-        "columns": [str, ...],   # result column names
-        "rows":    [[...], ...], # result rows (lists)
-        "row_count": int,
-        "model":   str,
+        "answer":        str,          # natural language answer
+        "sql":           str,          # final executed SQL
+        "columns":       [str, ...],   # result column names
+        "rows":          [[...], ...], # result rows
+        "row_count":     int,
+        "model":         str,
+        "heal_attempts": int,          # 0 = no healing needed
       }
     """
     if not _model_ready():
@@ -251,17 +312,25 @@ def sql_chat(db: Session, question: str) -> dict:
             "It may still be downloading — please wait a few minutes and retry."
         )
 
-    # ── Step 1: Generate SQL ────────────────────────────────────────────────
+    # ── Step 1: Build prompt with optional memory context ───────────────────
+    memory_block = _build_memory_context(history or [])
+    memory_section = f"\n{memory_block}\n" if memory_block else ""
+
     sql_prompt = (
-        f"Schema:\n{_SCHEMA_CONTEXT}\n\n"
+        f"Schema:\n{_SCHEMA_CONTEXT}"
+        f"{memory_section}\n"
         f"Question: {question}\n\n"
         "SQL query:"
     )
     sql_system = (
         "You are a PostgreSQL expert. "
         "Given a schema and a question, output ONLY a valid SQL SELECT query. "
+        "If there is previous conversation context, use it to resolve references "
+        "like 'those subjects', 'the same site', 'now filter by'. "
         "No explanations, no markdown, just the SQL."
     )
+
+    # ── Step 2: Generate initial SQL ────────────────────────────────────────
     raw_sql_response = _ollama_generate(sql_prompt, system=sql_system)
     generated_sql    = _extract_sql(raw_sql_response)
 
@@ -270,17 +339,43 @@ def sql_chat(db: Session, question: str) -> dict:
             f"Generated SQL is not a safe SELECT statement:\n{generated_sql}"
         )
 
-    # ── Step 2: Execute SQL ─────────────────────────────────────────────────
-    try:
-        result  = db.execute(text(generated_sql))
-        columns = list(result.keys())
-        rows    = [list(row) for row in result.fetchmany(MAX_ROWS)]
-    except Exception as exc:
-        raise ValueError(f"SQL execution failed: {exc}\n\nGenerated SQL:\n{generated_sql}") from exc
+    # ── Step 3: Execute SQL — HealerAgent retries on failure ────────────────
+    heal_attempts = 0
+    columns: list[str] = []
+    rows: list[list] = []
 
-    # ── Step 3: Generate natural language answer ────────────────────────────
+    for attempt in range(MAX_HEAL_ATTEMPTS + 1):
+        try:
+            result  = db.execute(text(generated_sql))
+            columns = list(result.keys())
+            rows    = [list(row) for row in result.fetchmany(MAX_ROWS)]
+            break  # success — exit retry loop
+        except Exception as exc:
+            db.rollback()
+            error_str = str(exc)
+
+            if attempt < MAX_HEAL_ATTEMPTS:
+                heal_attempts += 1
+                log.warning(
+                    "SQL attempt %d/%d failed — HealerAgent activating. Error: %s",
+                    attempt + 1, MAX_HEAL_ATTEMPTS, error_str[:300],
+                )
+                healed_sql = _heal_sql(generated_sql, error_str, question)
+                if _is_safe(healed_sql):
+                    generated_sql = healed_sql
+                else:
+                    log.warning("HealerAgent produced unsafe SQL — stopping retries.")
+                    raise ValueError(
+                        f"HealerAgent produced an unsafe SQL statement:\n{healed_sql}"
+                    )
+            else:
+                raise ValueError(
+                    f"SQL execution failed after {heal_attempts} healing attempt(s).\n"
+                    f"Last error: {error_str}\n\nFinal SQL:\n{generated_sql}"
+                ) from exc
+
+    # ── Step 4: Generate natural language answer ─────────────────────────────
     if rows:
-        # Build a compact table string for the LLM
         header   = " | ".join(columns)
         divider  = "-" * len(header)
         data_str = "\n".join(" | ".join(str(v) for v in row) for row in rows[:20])
@@ -305,10 +400,11 @@ def sql_chat(db: Session, question: str) -> dict:
     answer = _ollama_generate(answer_prompt, system=answer_system)
 
     return {
-        "answer":    answer,
-        "sql":       generated_sql,
-        "columns":   columns,
-        "rows":      rows,
-        "row_count": len(rows),
-        "model":     SQL_MODEL,
+        "answer":        answer,
+        "sql":           generated_sql,
+        "columns":       columns,
+        "rows":          rows,
+        "row_count":     len(rows),
+        "model":         SQL_MODEL,
+        "heal_attempts": heal_attempts,
     }
