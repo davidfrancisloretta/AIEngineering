@@ -1,4 +1,6 @@
 import os
+import json
+from typing import Generator
 
 import requests
 
@@ -198,6 +200,29 @@ class ApiClient:
             _raise(resp)
         return resp.json()
 
+    def rag_chat_stream(
+        self, question: str, top_k: int = 5
+    ) -> Generator[dict, None, None]:
+        """
+        Stream RAG answer tokens from /rag/chat-stream.
+        Yields dicts: {"type":"token","text":"..."} or {"type":"done",...}
+        """
+        with requests.post(
+            f"{API_BASE}/rag/chat-stream",
+            json={"question": question, "top_k": top_k},
+            headers=self._headers,
+            stream=True,
+            timeout=180,
+        ) as resp:
+            if not resp.ok:
+                _raise(resp)
+            for line in resp.iter_lines():
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        pass
+
     def rag_chat(self, question: str, top_k: int = 5) -> dict:
         resp = requests.post(
             f"{API_BASE}/rag/chat",
@@ -218,6 +243,18 @@ class ApiClient:
             json={"question": question, "history": history or []},
             headers=self._headers,
             timeout=180,
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def submit_feedback(self, log_id: int, feedback: int) -> dict:
+        """Submit thumbs up (1) or thumbs down (-1) for a query log entry."""
+        resp = requests.post(
+            f"{API_BASE}/rag/feedback/{log_id}",
+            json={"feedback": feedback},
+            headers=self._headers,
+            timeout=10,
         )
         if not resp.ok:
             _raise(resp)

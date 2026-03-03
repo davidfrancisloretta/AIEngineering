@@ -95,6 +95,7 @@ class RAGChatResponse(BaseModel):
     answer:  str
     sources: list[RAGSourceChunk]
     model:   str
+    log_id:  Optional[int] = None
 
 
 class RAGIngestResponse(BaseModel):
@@ -130,6 +131,11 @@ class SQLQueryResponse(BaseModel):
     row_count:     int
     model:         str
     heal_attempts: int = 0
+    log_id:        Optional[int] = None
+
+
+class FeedbackRequest(BaseModel):
+    feedback: int   # 1 = thumbs up, -1 = thumbs down
 
 
 # ── ODM Upload ──────────────────────────────────────────────────────────────

@@ -19,9 +19,11 @@ st.markdown("---")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for key, default in [
-    ("rag_history",  []),
-    ("last_sources", []),
-    ("sql_history",  []),
+    ("rag_history",    []),
+    ("last_sources",   []),
+    ("sql_history",    []),
+    ("rated_logs",     {}),
+    ("stream_rag_q",   None),   # pending Vector RAG question to stream
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -32,8 +34,36 @@ tab_rag, tab_sql = st.tabs([
     "🗄️ Vectorless RAG",
 ])
 
+
+# ── Shared: feedback buttons ───────────────────────────────────────────────────
+def _feedback_row(log_id):
+    """Render 👍/👎 for a log entry, or a confirmation if already rated."""
+    if not log_id:
+        return
+    rated = st.session_state["rated_logs"]
+    if log_id in rated:
+        icon = "👍" if rated[log_id] == 1 else "👎"
+        st.caption(f"{icon} Feedback recorded")
+        return
+    col1, col2, _ = st.columns([1, 1, 10])
+    if col1.button("👍", key=f"up_{log_id}", help="Helpful"):
+        try:
+            client.submit_feedback(log_id, 1)
+            st.session_state["rated_logs"][log_id] = 1
+            st.rerun()
+        except ApiError:
+            pass
+    if col2.button("👎", key=f"dn_{log_id}", help="Not helpful"):
+        try:
+            client.submit_feedback(log_id, -1)
+            st.session_state["rated_logs"][log_id] = -1
+            st.rerun()
+        except ApiError:
+            pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Vector RAG Chat (existing)
+# TAB 1 — Vector RAG Chat (streaming)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_rag:
     col_chat, col_src = st.columns([3, 1])
@@ -46,7 +76,8 @@ with tab_rag:
                 st.success(
                     f"✅ Ollama ready  ·  LLM: `{status['llm_model']}`  "
                     f"·  Embed: `{status['embed_model']}`  "
-                    f"·  Chunks indexed: **{status['chunk_count']}**"
+                    f"·  Chunks indexed: **{status['chunk_count']}**  "
+                    f"·  Hybrid search enabled"
                 )
                 if status["chunk_count"] == 0:
                     st.warning(
@@ -54,16 +85,13 @@ with tab_rag:
                         "**Seed Demo Data** then **Ingest for RAG** first."
                     )
             else:
-                st.warning(
-                    "⏳ Ollama is starting up — models may still be downloading. "
-                    "Run `docker exec ai_ollama ollama list` to check progress."
-                )
+                st.warning("⏳ Ollama is starting up — models may still be downloading.")
         except ApiError:
             st.error("Could not reach the backend.")
 
         st.markdown("---")
 
-        # Suggested questions
+        # Suggestion buttons — queue question for streaming on next render
         st.markdown("**Try asking:**")
         rag_suggestions = [
             "Which subjects had severe adverse events?",
@@ -76,41 +104,53 @@ with tab_rag:
         for i, suggestion in enumerate(rag_suggestions):
             if cols[i].button(suggestion, use_container_width=True, key=f"rag_sug_{i}"):
                 st.session_state["rag_history"].append({"role": "user", "content": suggestion})
-                with st.spinner("Thinking…"):
-                    try:
-                        result = client.rag_chat(suggestion)
-                        st.session_state["rag_history"].append(
-                            {"role": "assistant", "content": result["answer"]}
-                        )
-                        st.session_state["last_sources"] = result.get("sources", [])
-                    except ApiError as e:
-                        st.session_state["rag_history"].append(
-                            {"role": "assistant", "content": f"Error: {e}"}
-                        )
+                st.session_state["stream_rag_q"] = suggestion
                 st.rerun()
 
         st.markdown("---")
 
+        # Render settled history (all completed exchanges)
         for msg in st.session_state["rag_history"]:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                if msg["role"] == "assistant":
+                    _feedback_row(msg.get("log_id"))
 
-        question = st.chat_input("Ask about clinical trial data (vector search)…", key="rag_input")
+        # Chat input
+        question = st.chat_input("Ask about clinical trial data…", key="rag_input")
         if question:
             st.session_state["rag_history"].append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
+            st.session_state["stream_rag_q"] = question
+            st.rerun()
+
+        # ── Streaming block — runs only when a question is pending ─────────────
+        pending_q = st.session_state.get("stream_rag_q")
+        if pending_q:
+            st.session_state["stream_rag_q"] = None   # clear before streaming
+
+            sources_out = []
+            log_id_out  = [None]
+
+            def _rag_token_gen(q=pending_q):
+                for event in client.rag_chat_stream(q):
+                    etype = event.get("type")
+                    if etype in ("token", "guardrail"):
+                        yield event["text"]
+                    elif etype == "done":
+                        sources_out.extend(event.get("sources", []))
+                        log_id_out[0] = event.get("log_id")
+
             with st.chat_message("assistant"):
-                with st.spinner("Retrieving and answering…"):
-                    try:
-                        result = client.rag_chat(question)
-                        answer = result["answer"]
-                        st.session_state["last_sources"] = result.get("sources", [])
-                    except ApiError as e:
-                        answer = f"Error: {e}"
-                        st.session_state["last_sources"] = []
-                st.markdown(answer)
-                st.session_state["rag_history"].append({"role": "assistant", "content": answer})
+                full_answer = st.write_stream(_rag_token_gen())
+                log_id = log_id_out[0]
+                _feedback_row(log_id)
+
+            st.session_state["last_sources"] = sources_out
+            st.session_state["rag_history"].append({
+                "role":    "assistant",
+                "content": full_answer or "",
+                "log_id":  log_id,
+            })
             st.rerun()
 
         if st.session_state["rag_history"]:
@@ -138,22 +178,19 @@ with tab_rag:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Text-to-SQL Chat
+# TAB 2 — Vectorless RAG (Text-to-SQL)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_sql:
     st.markdown(
         "Ask questions in plain English. Instead of vector similarity search, "
-        "the AI writes SQL directly against your structured clinical database and explains the results. "
-        "Uses **llama3.2:3b** — no embeddings, no vector index, exact answers. "
-        "**Follow-up questions work** — the AI remembers the last 3 exchanges."
+        "the AI writes directly against your structured clinical database and explains the results. "
+        "Uses **llama3.2:3b**. Follow-up questions work — the AI remembers the last 3 exchanges."
     )
 
-    # Model status
     try:
         status = client.rag_status()
-        sql_ready = status.get("ollama_ready", False)
-        if sql_ready:
-            st.info("Model: `llama3.2:3b`  ·  Direct SQL against PostgreSQL  ·  HealerAgent enabled")
+        if status.get("ollama_ready", False):
+            st.info("Model: `llama3.2:3b`")
         else:
             st.warning("⏳ Ollama still loading — llama3.2:3b may not be ready yet.")
     except ApiError:
@@ -161,7 +198,6 @@ with tab_sql:
 
     st.markdown("---")
 
-    # Suggested SQL questions
     st.markdown("**Try asking:**")
     sql_suggestions = [
         "How many subjects are in each site?",
@@ -173,7 +209,6 @@ with tab_sql:
     sql_cols = st.columns(len(sql_suggestions))
     for i, suggestion in enumerate(sql_suggestions):
         if sql_cols[i].button(suggestion, use_container_width=True, key=f"sql_sug_{i}"):
-            # Build history for memory context (exclude rows/columns — too large)
             history_payload = [
                 {"role": m["role"], "content": m["content"], "sql": m.get("sql", "")}
                 for m in st.session_state["sql_history"]
@@ -183,24 +218,25 @@ with tab_sql:
                 try:
                     result = client.rag_sql_query(suggestion, history=history_payload)
                     st.session_state["sql_history"].append({
-                        "role":         "assistant",
-                        "content":      result["answer"],
-                        "sql":          result["sql"],
-                        "columns":      result["columns"],
-                        "rows":         result["rows"],
-                        "count":        result["row_count"],
+                        "role":          "assistant",
+                        "content":       result["answer"],
+                        "sql":           result["sql"],
+                        "columns":       result["columns"],
+                        "rows":          result["rows"],
+                        "count":         result["row_count"],
                         "heal_attempts": result.get("heal_attempts", 0),
+                        "log_id":        result.get("log_id"),
                     })
                 except ApiError as e:
-                    st.session_state["sql_history"].append(
-                        {"role": "assistant", "content": f"Error: {e}", "sql": "",
-                         "columns": [], "rows": [], "count": 0, "heal_attempts": 0}
-                    )
+                    st.session_state["sql_history"].append({
+                        "role": "assistant", "content": f"Error: {e}",
+                        "sql": "", "columns": [], "rows": [],
+                        "count": 0, "heal_attempts": 0, "log_id": None,
+                    })
             st.rerun()
 
     st.markdown("---")
 
-    # Chat history
     for msg in st.session_state["sql_history"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -214,14 +250,14 @@ with tab_sql:
                     if msg.get("columns") and msg.get("rows"):
                         df = pd.DataFrame(msg["rows"], columns=msg["columns"])
                         st.dataframe(df, use_container_width=True, hide_index=True)
+            if msg["role"] == "assistant":
+                _feedback_row(msg.get("log_id"))
 
-    # Chat input
     sql_question = st.chat_input(
         "Ask a data question — follow-ups work, e.g. 'now show only the severe ones'",
         key="sql_input",
     )
     if sql_question:
-        # Snapshot history before appending the new user message
         history_payload = [
             {"role": m["role"], "content": m["content"], "sql": m.get("sql", "")}
             for m in st.session_state["sql_history"]
@@ -233,13 +269,14 @@ with tab_sql:
         with st.chat_message("assistant"):
             with st.spinner("Generating SQL and querying database…"):
                 try:
-                    result       = client.rag_sql_query(sql_question, history=history_payload)
-                    answer       = result["answer"]
-                    sql_out      = result["sql"]
-                    columns      = result["columns"]
-                    rows         = result["rows"]
-                    count        = result["row_count"]
+                    result        = client.rag_sql_query(sql_question, history=history_payload)
+                    answer        = result["answer"]
+                    sql_out       = result["sql"]
+                    columns       = result["columns"]
+                    rows          = result["rows"]
+                    count         = result["row_count"]
                     heal_attempts = result.get("heal_attempts", 0)
+                    log_id        = result.get("log_id")
                 except ApiError as e:
                     answer        = f"Error: {e}"
                     sql_out       = ""
@@ -247,6 +284,7 @@ with tab_sql:
                     rows          = []
                     count         = 0
                     heal_attempts = 0
+                    log_id        = None
 
             st.markdown(answer)
             if sql_out:
@@ -256,6 +294,7 @@ with tab_sql:
                     if columns and rows:
                         df = pd.DataFrame(rows, columns=columns)
                         st.dataframe(df, use_container_width=True, hide_index=True)
+            _feedback_row(log_id)
 
             st.session_state["sql_history"].append({
                 "role":          "assistant",
@@ -265,6 +304,7 @@ with tab_sql:
                 "rows":          rows,
                 "count":         count,
                 "heal_attempts": heal_attempts,
+                "log_id":        log_id,
             })
         st.rerun()
 

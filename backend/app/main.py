@@ -47,6 +47,11 @@ def _ensure_vector_extension():
             ON document_chunks USING hnsw (embedding vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
         """))
+        # GIN index for BM25 full-text search (hybrid retrieval)
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_fts
+            ON document_chunks USING gin(to_tsvector('english', chunk_text))
+        """))
         conn.commit()
 
 

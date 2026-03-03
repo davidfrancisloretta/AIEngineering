@@ -4,7 +4,7 @@ Shares the same declarative Base as models.py.
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Float, Date, Text, DateTime, ForeignKey, Boolean, SmallInteger
 from sqlalchemy.orm import relationship
 
 from models import Base
@@ -78,6 +78,25 @@ class ClinicalForm(Base):
     created_at = Column(DateTime, default=_now)
 
     visit = relationship("ClinicalVisit", back_populates="forms")
+
+
+class QueryLog(Base):
+    """
+    Logs every RAG and SQL query for observability and user feedback collection.
+    """
+    __tablename__ = "query_logs"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    user_id          = Column(Integer, ForeignKey("users.id"), nullable=True)
+    query_type       = Column(String(20), nullable=False)   # 'vector' | 'sql'
+    question         = Column(Text, nullable=False)
+    answer           = Column(Text)
+    sql_generated    = Column(Text, nullable=True)
+    heal_attempts    = Column(Integer, default=0)
+    row_count        = Column(Integer, nullable=True)
+    response_time_ms = Column(Integer, nullable=True)
+    feedback         = Column(SmallInteger, nullable=True)  # 1=thumbs up, -1=thumbs down
+    created_at       = Column(DateTime, default=_now)
 
 
 class DocumentChunk(Base):

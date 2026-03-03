@@ -1,9 +1,12 @@
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from dependencies import get_db, get_current_user
 from models import User
-from models_clinical import DocumentChunk
+from models_clinical import DocumentChunk, QueryLog
 from schemas_clinical import (
     RAGChatRequest,
     RAGChatResponse,
@@ -11,6 +14,7 @@ from schemas_clinical import (
     RAGStatusResponse,
     SQLQueryRequest,
     SQLQueryResponse,
+    FeedbackRequest,
 )
 import services.rag as rag_service
 import services.ingestion as ingestion_service
@@ -43,15 +47,13 @@ def ingest_clinical_data(
     """
     Embed all clinical trial data and store chunks in document_chunks.
     Requires Ollama to be running and clinical data to be seeded first.
-    Takes 10-40 seconds for the full demo dataset (~200 chunks).
     """
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
             detail=(
                 "Ollama service is not available. "
-                "Wait for the ai_ollama container to finish downloading models "
-                "(check 'docker exec ai_ollama ollama list')."
+                "Wait for the ai_ollama container to finish downloading models."
             ),
         )
     count = ingestion_service.ingest_all(db)
@@ -68,16 +70,42 @@ def chat(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Answer a clinical trial question using RAG:
-    embed → pgvector cosine search → Ollama LLM → return answer + sources.
+    Non-streaming RAG: embed → hybrid search (BM25+vector+RRF) → LLM → answer.
+    Guardrail rejects off-topic questions. Query logged for feedback.
     """
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
             detail="Ollama service is not available. Please wait for models to finish loading.",
         )
-    result = rag_service.answer_question(db, body.question, top_k=body.top_k)
+    result = rag_service.answer_question(
+        db, body.question, top_k=body.top_k, user_id=current_user.id
+    )
     return result
+
+
+@router.post("/chat-stream")
+def chat_stream(
+    body: RAGChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Streaming RAG: hybrid retrieve → stream LLM tokens → send sources + log_id at end.
+    Returns newline-delimited JSON (application/x-ndjson).
+    Each line: {"type":"token","text":"..."} | {"type":"done","sources":[...],"log_id":N}
+    """
+    if not ollama_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama service is not available.",
+        )
+    return StreamingResponse(
+        rag_service.stream_answer_question(
+            db, body.question, top_k=body.top_k, user_id=current_user.id
+        ),
+        media_type="application/x-ndjson",
+    )
 
 
 @router.post("/sql-query", response_model=SQLQueryResponse)
@@ -87,16 +115,54 @@ def sql_query(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Answer a clinical trial question using Text-to-SQL:
-    question → llama3.2:3b generates SQL → execute → LLM summarises → answer + raw data.
-    Supports conversation history for follow-up questions.
-    HealerAgent automatically retries broken SQL up to 3 times.
+    Text-to-SQL: question → llama3.2:3b → SQL → execute → LLM summary.
+    HealerAgent retries broken SQL up to 3 times. Query logged for feedback.
     """
     history = [msg.model_dump() for msg in body.history] if body.history else []
+    t0 = time.monotonic()
     try:
         result = text_to_sql_service.sql_chat(db, body.question, history=history)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    # Log the query
+    entry = QueryLog(
+        user_id          = current_user.id,
+        query_type       = "sql",
+        question         = body.question,
+        answer           = result["answer"],
+        sql_generated    = result["sql"],
+        heal_attempts    = result.get("heal_attempts", 0),
+        row_count        = result["row_count"],
+        response_time_ms = elapsed_ms,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    result["log_id"] = entry.id
+
     return result
+
+
+@router.post("/feedback/{log_id}")
+def submit_feedback(
+    log_id: int,
+    body:   FeedbackRequest,
+    db:     Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Record thumbs up (1) or thumbs down (-1) against a query log entry.
+    """
+    if body.feedback not in (1, -1):
+        raise HTTPException(status_code=422, detail="feedback must be 1 or -1")
+    entry = db.query(QueryLog).filter(QueryLog.id == log_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Log entry not found")
+    entry.feedback = body.feedback
+    db.commit()
+    return {"ok": True, "log_id": log_id, "feedback": body.feedback}

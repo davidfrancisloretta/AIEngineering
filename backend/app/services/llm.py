@@ -3,6 +3,8 @@ Ollama HTTP client for embeddings and text generation.
 Uses the existing 'requests' library (sync) to match the rest of the service layer.
 """
 import os
+import json
+from typing import Generator
 import requests
 
 OLLAMA_BASE  = os.getenv("OLLAMA_URL",          "http://ollama:11434")
@@ -45,6 +47,39 @@ def generate_text(prompt: str, system: str = "") -> str:
     )
     resp.raise_for_status()
     return resp.json()["response"]
+
+
+def stream_generate_text(prompt: str, system: str = "") -> Generator[str, None, None]:
+    """
+    Stream text generation from Ollama, yielding one token string at a time.
+    Caller iterates this generator inside a FastAPI StreamingResponse.
+    """
+    payload: dict = {
+        "model":  LLM_MODEL,
+        "prompt": prompt,
+        "stream": True,
+    }
+    if system:
+        payload["system"] = system
+
+    resp = requests.post(
+        f"{OLLAMA_BASE}/api/generate",
+        json=payload,
+        stream=True,
+        timeout=180,
+    )
+    resp.raise_for_status()
+    for line in resp.iter_lines():
+        if line:
+            try:
+                data  = json.loads(line)
+                token = data.get("response", "")
+                if token:
+                    yield token
+                if data.get("done"):
+                    break
+            except json.JSONDecodeError:
+                pass
 
 
 def ollama_ready() -> bool:
