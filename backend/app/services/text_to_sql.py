@@ -17,6 +17,7 @@ import logging
 import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+import services.memory_service as memory_service
 
 log = logging.getLogger("text_to_sql")
 
@@ -285,15 +286,21 @@ def _heal_sql(broken_sql: str, db_error: str, question: str) -> str:
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
-def sql_chat(db: Session, question: str, history: list[dict] | None = None) -> dict:
+def sql_chat(
+    db: Session,
+    question: str,
+    history: list[dict] | None = None,
+    user_id: int | None = None,
+) -> dict:
     """
-    Full Text-to-SQL pipeline with HealerAgent and conversation memory.
+    Full Text-to-SQL pipeline with HealerAgent, conversation memory, and Mem0.
 
     Args:
       db:       SQLAlchemy session
       question: User's natural language question
       history:  Optional list of previous conversation turns, each:
                 {"role": "user"|"assistant", "content": str, "sql": str}
+      user_id:  Optional user id for Mem0 long-term memory retrieval/storage
 
     Returns:
       {
@@ -312,12 +319,25 @@ def sql_chat(db: Session, question: str, history: list[dict] | None = None) -> d
             "It may still be downloading — please wait a few minutes and retry."
         )
 
-    # ── Step 1: Build prompt with optional memory context ───────────────────
+    # ── Step 1: Build prompt with conversation history + Mem0 long-term memory ─
     memory_block = _build_memory_context(history or [])
     memory_section = f"\n{memory_block}\n" if memory_block else ""
 
+    # Inject Mem0 long-term memories (no-op when API key is absent)
+    mem0_section = ""
+    if user_id:
+        mem_results = memory_service.search_memories(question, user_id)
+        mem_lines = [f"- {m.get('memory', '')}" for m in mem_results if m.get("memory")]
+        if mem_lines:
+            mem0_section = (
+                "\n--- Long-term memory (facts from previous sessions) ---\n"
+                + "\n".join(mem_lines)
+                + "\n--- End long-term memory ---\n"
+            )
+
     sql_prompt = (
         f"Schema:\n{_SCHEMA_CONTEXT}"
+        f"{mem0_section}"
         f"{memory_section}\n"
         f"Question: {question}\n\n"
         "SQL query:"
@@ -398,6 +418,14 @@ def sql_chat(db: Session, question: str, history: list[dict] | None = None) -> d
         "Reference specific numbers and findings from the data."
     )
     answer = _ollama_generate(answer_prompt, system=answer_system)
+
+    # Store this exchange in Mem0 for future sessions (no-op when key is absent)
+    if user_id:
+        memory_service.add_memory(
+            [{"role": "user", "content": question},
+             {"role": "assistant", "content": answer}],
+            user_id,
+        )
 
     return {
         "answer":        answer,

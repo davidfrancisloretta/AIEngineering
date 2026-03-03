@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from services.llm import embed_text, generate_text, stream_generate_text, LLM_MODEL
 from models_clinical import QueryLog
+import services.memory_service as memory_service
 
 log = logging.getLogger("rag")
 
@@ -179,17 +180,33 @@ def retrieve_chunks(db: Session, question: str, top_k: int = 5) -> list[dict]:
 
 # ── Prompt assembly ────────────────────────────────────────────────────────────
 
-def build_prompt(question: str, chunks: list[dict]) -> str:
-    """Assemble the LLM prompt with numbered context blocks."""
+def build_prompt(
+    question: str,
+    chunks: list[dict],
+    memories: list[dict] | None = None,
+) -> str:
+    """Assemble the LLM prompt with numbered context blocks and optional Mem0 memories."""
     context_lines = []
     for i, chunk in enumerate(chunks, start=1):
         context_lines.append(
             f"[Source {i} — {chunk['source_type']}]\n{chunk['chunk_text']}"
         )
     context_block = "\n\n".join(context_lines)
+
+    memory_block = ""
+    if memories:
+        mem_lines = [f"- {m.get('memory', '')}" for m in memories if m.get("memory")]
+        if mem_lines:
+            memory_block = (
+                "\nRelevant facts remembered from previous conversations:\n"
+                + "\n".join(mem_lines)
+                + "\n"
+            )
+
     return (
         f"Context from clinical trial database:\n\n"
-        f"{context_block}\n\n"
+        f"{context_block}\n"
+        f"{memory_block}\n"
         f"Question: {question}\n\n"
         f"Answer based strictly on the context above:"
     )
@@ -273,7 +290,10 @@ def answer_question(
             "log_id":  None,
         }
 
-    prompt = build_prompt(question, chunks)
+    # Search Mem0 for relevant past context (no-op when key is absent)
+    memories = memory_service.search_memories(question, user_id) if user_id else []
+
+    prompt = build_prompt(question, chunks, memories=memories)
     answer = generate_text(prompt, system=SYSTEM_PROMPT)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
@@ -282,6 +302,14 @@ def answer_question(
         user_id=user_id,
         response_time_ms=elapsed_ms,
     )
+
+    # Store this exchange in Mem0 for future context
+    if user_id:
+        memory_service.add_memory(
+            [{"role": "user", "content": question},
+             {"role": "assistant", "content": answer}],
+            user_id,
+        )
 
     return {
         "answer":  answer,
@@ -325,7 +353,10 @@ def stream_answer_question(
         yield json.dumps({"type": "done", "sources": [], "log_id": None}) + "\n"
         return
 
-    prompt = build_prompt(question, chunks)
+    # Search Mem0 for relevant past context (no-op when key is absent)
+    memories = memory_service.search_memories(question, user_id) if user_id else []
+
+    prompt = build_prompt(question, chunks, memories=memories)
     full_answer = []
 
     for token in stream_generate_text(prompt, system=SYSTEM_PROMPT):
@@ -346,3 +377,11 @@ def stream_answer_question(
         "sources": _format_sources(chunks),
         "log_id":  log_id,
     }) + "\n"
+
+    # Store this exchange in Mem0 after streaming is complete
+    if user_id:
+        memory_service.add_memory(
+            [{"role": "user", "content": question},
+             {"role": "assistant", "content": answer_text}],
+            user_id,
+        )

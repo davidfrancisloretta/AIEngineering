@@ -19,6 +19,7 @@ from schemas_clinical import (
 import services.rag as rag_service
 import services.ingestion as ingestion_service
 import services.text_to_sql as text_to_sql_service
+import services.memory_service as memory_service
 from services.llm import ollama_ready, list_models, EMBED_MODEL, LLM_MODEL
 
 router = APIRouter(prefix="/rag", tags=["rag"])
@@ -121,7 +122,9 @@ def sql_query(
     history = [msg.model_dump() for msg in body.history] if body.history else []
     t0 = time.monotonic()
     try:
-        result = text_to_sql_service.sql_chat(db, body.question, history=history)
+        result = text_to_sql_service.sql_chat(
+            db, body.question, history=history, user_id=current_user.id
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
@@ -166,3 +169,28 @@ def submit_feedback(
     entry.feedback = body.feedback
     db.commit()
     return {"ok": True, "log_id": log_id, "feedback": body.feedback}
+
+
+@router.get("/memories")
+def get_memories(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return all Mem0 memories stored for the current user.
+    Returns {"enabled": false, "memories": []} when MEM0_API_KEY is not set.
+    """
+    memories = memory_service.get_all_memories(current_user.id)
+    return {
+        "enabled":  memory_service.is_enabled(),
+        "memories": memories,
+        "count":    len(memories),
+    }
+
+
+@router.delete("/memories")
+def delete_memories(
+    current_user: User = Depends(get_current_user),
+):
+    """Delete all Mem0 memories for the current user."""
+    success = memory_service.delete_all_memories(current_user.id)
+    return {"ok": success, "enabled": memory_service.is_enabled()}

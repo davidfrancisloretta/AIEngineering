@@ -260,6 +260,24 @@ class ApiClient:
             _raise(resp)
         return resp.json()
 
+    def get_memories(self) -> dict:
+        """Return all Mem0 memories for the current user."""
+        resp = requests.get(
+            f"{API_BASE}/rag/memories", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def clear_memories(self) -> dict:
+        """Delete all Mem0 memories for the current user."""
+        resp = requests.delete(
+            f"{API_BASE}/rag/memories", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
     # --------------------------------------------------
     # ODM XML upload
     # --------------------------------------------------
