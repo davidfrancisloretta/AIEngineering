@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from utils.api import ApiClient, ApiError
+from utils.styles import page_header, badge
 
 if "token" not in st.session_state:
     st.error("Please log in first.")
@@ -14,9 +15,23 @@ if "token" not in st.session_state:
 
 client = ApiClient(token=st.session_state["token"])
 
-st.title("📊 Dashboard")
-st.markdown(f"Logged in as **{st.session_state.get('email', '')}**")
+page_header("📊", "Analytics", "Dashboard",
+            subtitle=f"Logged in as {st.session_state.get('email', '')}")
 st.markdown("---")
+
+# Plotly dark template aligned to RAVE AI design system
+PLOT_TEMPLATE = dict(
+    layout=dict(
+        paper_bgcolor="#161B22",
+        plot_bgcolor="#161B22",
+        font=dict(family="Geist, sans-serif", color="#E6EDF3", size=13),
+        colorway=["#FF8400", "#388BFD", "#3FB950", "#D29922", "#F85149",
+                  "#A371F7", "#39C5CF", "#FF6E6E"],
+        xaxis=dict(gridcolor="rgba(255,255,255,0.06)", linecolor="rgba(255,255,255,0.08)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.06)", linecolor="rgba(255,255,255,0.08)"),
+        margin=dict(t=44, b=8, l=8, r=8),
+    )
+)
 
 tab_rave, tab_campaign = st.tabs(["Rave Transactions", "Campaign Metrics"])
 
@@ -65,7 +80,8 @@ with tab_rave:
                 .rename(columns={"fetched_at": "Date", "amount": "Revenue"})
             )
             fig = px.line(daily, x="Date", y="Revenue", title="Revenue Over Time", markers=True)
-            fig.update_layout(margin=dict(t=40, b=0))
+            fig.update_layout(**PLOT_TEMPLATE["layout"])
+            fig.update_traces(line_color="#FF8400", marker_color="#FF8400")
             st.plotly_chart(fig, use_container_width=True)
 
         with c2:
@@ -73,10 +89,10 @@ with tab_rave:
             status_df.columns = ["Status", "Count"]
             fig = px.pie(
                 status_df, values="Count", names="Status",
-                title="Transaction Status", hole=0.35,
-                color_discrete_sequence=px.colors.qualitative.Set2,
+                title="Transaction Status", hole=0.40,
+                color_discrete_sequence=["#FF8400","#388BFD","#3FB950","#F85149"],
             )
-            fig.update_layout(margin=dict(t=40, b=0))
+            fig.update_layout(**PLOT_TEMPLATE["layout"])
             st.plotly_chart(fig, use_container_width=True)
 
         # ── Charts row 2 ─────────────────────────────────
@@ -89,9 +105,10 @@ with tab_rave:
                 pay_df, x="Payment Method", y="Count",
                 title="Payment Methods",
                 color="Payment Method",
-                color_discrete_sequence=px.colors.qualitative.Pastel,
+                color_discrete_sequence=["#FF8400","#388BFD","#3FB950","#D29922","#F85149"],
             )
-            fig.update_layout(showlegend=False, margin=dict(t=40, b=0))
+            layout = dict(**PLOT_TEMPLATE["layout"]); layout["showlegend"] = False
+            fig.update_layout(**layout)
             st.plotly_chart(fig, use_container_width=True)
 
         with c4:
@@ -101,9 +118,10 @@ with tab_rave:
                 cur_df, x="Currency", y="Revenue",
                 title="Revenue by Currency",
                 color="Currency",
-                color_discrete_sequence=px.colors.qualitative.Bold,
+                color_discrete_sequence=["#FF8400","#388BFD","#3FB950","#D29922"],
             )
-            fig.update_layout(showlegend=False, margin=dict(t=40, b=0))
+            layout = dict(**PLOT_TEMPLATE["layout"]); layout["showlegend"] = False
+            fig.update_layout(**layout)
             st.plotly_chart(fig, use_container_width=True)
 
         # ── Recent transactions table ─────────────────────
@@ -142,9 +160,9 @@ with tab_campaign:
                 mdf, x="campaign_name", y=["ttr", "vtr", "cvr"],
                 barmode="group", title="Rates by Campaign",
                 labels={"value": "Rate", "variable": "Metric"},
-                color_discrete_sequence=px.colors.qualitative.Set1,
+                color_discrete_sequence=["#FF8400","#388BFD","#3FB950"],
             )
-            fig.update_layout(margin=dict(t=40, b=0))
+            fig.update_layout(**PLOT_TEMPLATE["layout"])
             st.plotly_chart(fig, use_container_width=True)
 
         with mc2:
@@ -153,8 +171,9 @@ with tab_campaign:
                 size="clicks", color="campaign_name",
                 title="Impressions vs Conversions",
                 hover_data=["campaign_name"],
+                color_discrete_sequence=["#FF8400","#388BFD","#3FB950","#D29922"],
             )
-            fig.update_layout(margin=dict(t=40, b=0))
+            fig.update_layout(**PLOT_TEMPLATE["layout"])
             st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("---")

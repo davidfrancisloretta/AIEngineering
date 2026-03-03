@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import streamlit as st
 from utils.api import ApiClient, ApiError
+from utils.styles import page_header
 
 if "token" not in st.session_state:
     st.error("Please log in first.")
@@ -13,8 +14,8 @@ if "token" not in st.session_state:
 
 client = ApiClient(token=st.session_state["token"])
 
-st.title("🤖 Clinical Trial AI Chat")
-st.markdown("Ask natural language questions about your clinical trial data using two AI approaches.")
+page_header("🤖", "Clinical Trial", "AI Chat",
+            subtitle="Vector RAG · Vectorless RAG · Hybrid Search · Streaming")
 st.markdown("---")
 
 # ── Session state ─────────────────────────────────────────────────────────────
