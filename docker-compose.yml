@@ -16,6 +16,8 @@ services:
       - OLLAMA_LLM_MODEL=tinyllama
       - OLLAMA_SQL_MODEL=llama3.2:3b
       - MEM0_API_KEY=${MEM0_API_KEY:-}
+      - OPIK_API_KEY=${OPIK_API_KEY:-}
+      - OPIK_PROJECT_NAME=rave-analytics-rag
     ports:
       - "8000:8000"
 

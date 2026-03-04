@@ -17,6 +17,8 @@ import logging
 import requests
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+import opik
+from opik import opik_context
 import services.memory_service as memory_service
 
 log = logging.getLogger("text_to_sql")
@@ -122,7 +124,7 @@ WHERE f.form_oid = 'LB'
 _SCHEMA_CONTEXT = """
 PostgreSQL clinical trial database.
 
-TABLES:
+TABLES (ONLY these 4 tables exist — do NOT invent others):
   clinical_studies(id, study_oid, protocol_name, phase, sponsor, therapeutic_area, status)
   clinical_subjects(id, study_id, subject_key, site_id, site_name, age, sex, race, enrollment_date, status)
   clinical_visits(id, subject_id, visit_oid, visit_name, visit_date, status)
@@ -131,27 +133,32 @@ TABLES:
 VIEWS (prefer these for analysis):
   v_form_items(study_oid, subject_key, site_id, site_name, subject_status,
                visit_name, visit_date, form_oid, form_name, item_name, item_value)
-    -- All form data as flat key-value rows; works for Rave and demo data.
-
   v_vital_signs(study_oid, subject_key, site_id, site_name,
                 visit_name, visit_date, heart_rate, systolic_bp, diastolic_bp,
                 temperature, weight)
-    -- Demo data only (CARDIO-2024 study).
-
   v_adverse_events(study_oid, subject_key, site_id, site_name,
-                   visit_name, visit_date, ae_term, severity,
-                   drug_relationship, outcome)
-    -- Demo data only (CARDIO-2024 study).
-
+                   visit_name, visit_date, ae_term, severity, drug_relationship, outcome)
   v_lab_results(study_oid, subject_key, site_id, site_name,
                 visit_name, visit_date, test_name, test_code, value, unit, flag)
-    -- Demo data only (CARDIO-2024 study). flag: N=normal, H=high, L=low, HH/LL=critical.
 
-RULES:
-  - Write a single SELECT query only.
-  - Always add LIMIT {max_rows} unless the user asks for counts/aggregates.
-  - Use v_form_items for Rave data (B_Demostudy) since it has no VS/AE/LB views.
-  - subject_key in Rave data is a UUID; item_name/item_value hold the actual data.
+CRITICAL RULES — violating these causes errors:
+  1. ONLY use the 4 tables and 4 views listed above. There is NO 'sites' table, NO 'patients'
+     table, NO 'enrollment' table. Do not invent table names.
+  2. clinical_visits does NOT have a subject_key column. To filter by subject_key or site_name,
+     JOIN clinical_visits to clinical_subjects: JOIN clinical_subjects s ON s.id = v.subject_id
+  3. To filter by site name, use: WHERE clinical_subjects.site_name = 'London'
+     NOT: WHERE site_id = (SELECT site_id FROM sites ...)  — the 'sites' table does not exist.
+  4. Write a single SELECT query only. Add LIMIT {max_rows} unless user asks for counts/aggregates.
+  5. Use v_form_items for Rave data (B_Demostudy). subject_key there is a UUID.
+
+EXAMPLE — subjects at a named site:
+  SELECT COUNT(*) FROM clinical_subjects WHERE site_name = 'London';
+
+EXAMPLE — subjects enrolled in a study at a site:
+  SELECT s.subject_key, s.site_name
+  FROM clinical_subjects s
+  JOIN clinical_studies cs ON cs.id = s.study_id
+  WHERE s.site_name = 'London' LIMIT {max_rows};
 """.format(max_rows=MAX_ROWS)
 
 
@@ -229,6 +236,7 @@ def _is_safe(sql: str) -> bool:
 
 # ── Ollama calls ───────────────────────────────────────────────────────────────
 
+@opik.track(name="ollama_sql_generate")
 def _ollama_generate(prompt: str, system: str = "") -> str:
     payload: dict = {
         "model":  SQL_MODEL,
@@ -245,6 +253,7 @@ def _ollama_generate(prompt: str, system: str = "") -> str:
             timeout=120,
         )
         resp.raise_for_status()
+        opik_context.update_current_span(metadata={"model": SQL_MODEL, "has_system_prompt": bool(system)})
         return resp.json().get("response", "").strip()
     except Exception as exc:
         raise RuntimeError(f"Ollama error ({SQL_MODEL}): {exc}") from exc
@@ -261,23 +270,32 @@ def _model_ready() -> bool:
 
 # ── HealerAgent ────────────────────────────────────────────────────────────────
 
+@opik.track(name="healer_agent_fix_sql")
 def _heal_sql(broken_sql: str, db_error: str, question: str) -> str:
     """
     HealerAgent: given a broken SQL statement and the database error it produced,
     ask the LLM to fix it. Returns the corrected SQL (not yet validated).
     """
+    opik_context.update_current_span(metadata={"model": SQL_MODEL, "error_preview": db_error[:200]})
     heal_prompt = (
         f"The following PostgreSQL query failed with an error.\n\n"
         f"Error message:\n{db_error}\n\n"
         f"Broken SQL:\n{broken_sql}\n\n"
         f"Original question: {question}\n\n"
-        f"Database schema:\n{_SCHEMA_CONTEXT}\n\n"
+        f"Database schema (ONLY these tables/views exist):\n{_SCHEMA_CONTEXT}\n\n"
+        "Common mistakes to fix:\n"
+        "- If error says 'relation X does not exist': you used a table that does not exist. "
+        "Use only: clinical_studies, clinical_subjects, clinical_visits, clinical_forms, "
+        "v_form_items, v_vital_signs, v_adverse_events, v_lab_results.\n"
+        "- There is NO 'sites' table. Filter by site using: clinical_subjects.site_name = 'London'\n"
+        "- clinical_visits has NO subject_key column. JOIN to clinical_subjects to get subject_key.\n"
+        "- If error says 'column X does not exist': check the schema above for the correct column name.\n\n"
         "Fixed SQL query:"
     )
     heal_system = (
         "You are a PostgreSQL expert. A SQL query has failed. "
-        "Fix the error and output ONLY the corrected SQL SELECT statement. "
-        "No explanations, no markdown, just the fixed SQL."
+        "Fix the error using ONLY the tables and views listed in the schema. "
+        "Output ONLY the corrected SQL SELECT statement — no explanations, no markdown."
     )
     log.info("HealerAgent: re-prompting LLM to fix SQL error: %s", db_error[:200])
     raw = _ollama_generate(heal_prompt, system=heal_system)
@@ -286,6 +304,7 @@ def _heal_sql(broken_sql: str, db_error: str, question: str) -> str:
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
+@opik.track(name="text_to_sql_chat")
 def sql_chat(
     db: Session,
     question: str,
@@ -427,6 +446,12 @@ def sql_chat(
             user_id,
         )
 
+    opik_context.update_current_span(metadata={
+        "model": SQL_MODEL,
+        "heal_attempts": heal_attempts,
+        "row_count": len(rows),
+        "has_history": bool(history),
+    })
     return {
         "answer":        answer,
         "sql":           generated_sql,

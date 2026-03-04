@@ -16,3 +16,4 @@ openpyxl
 xlrd
 pgvector
 mem0ai
+opik

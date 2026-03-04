@@ -54,7 +54,11 @@ def search_memories(query: str, user_id: int, limit: int = 5) -> list[dict]:
     if not client:
         return []
     try:
-        results = client.search(query, user_id=str(user_id), limit=limit)
+        # Mem0 v2 API requires filters dict; fall back to user_id kwarg for older clients
+        try:
+            results = client.search(query, filters={"user_id": str(user_id)}, limit=limit)
+        except TypeError:
+            results = client.search(query, user_id=str(user_id), limit=limit)
         if isinstance(results, dict):
             results = results.get("results", [])
         return results or []

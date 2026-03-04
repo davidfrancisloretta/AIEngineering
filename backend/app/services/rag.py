@@ -11,6 +11,8 @@ import logging
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import opik
+from opik import opik_context
 
 from services.llm import embed_text, generate_text, stream_generate_text, LLM_MODEL
 from models_clinical import QueryLog
@@ -256,6 +258,7 @@ def _log_query(
 
 # ── Non-streaming pipeline (existing /rag/chat endpoint) ──────────────────────
 
+@opik.track(name="rag_answer_question")
 def answer_question(
     db:       Session,
     question: str,
@@ -296,6 +299,13 @@ def answer_question(
     prompt = build_prompt(question, chunks, memories=memories)
     answer = generate_text(prompt, system=SYSTEM_PROMPT)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
+    opik_context.update_current_span(metadata={
+        "model": LLM_MODEL,
+        "top_k": top_k,
+        "chunks_retrieved": len(chunks),
+        "used_memory": bool(memories),
+        "response_time_ms": elapsed_ms,
+    })
 
     log_id = _log_query(
         db, "vector", question, answer,
@@ -321,6 +331,7 @@ def answer_question(
 
 # ── Streaming pipeline (/rag/chat-stream endpoint) ────────────────────────────
 
+@opik.track(name="rag_stream_answer")
 def stream_answer_question(
     db:       Session,
     question: str,
@@ -336,6 +347,7 @@ def stream_answer_question(
     Caller wraps this in FastAPI StreamingResponse(media_type="application/x-ndjson").
     """
     t0 = time.monotonic()
+    opik_context.update_current_span(metadata={"model": LLM_MODEL, "top_k": top_k})
 
     # Guardrail
     if not _is_clinical_relevant(question):

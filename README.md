@@ -211,7 +211,7 @@ Or click the **One-click Demo Login** button on the login page.
    - *"How many subjects are enrolled at the London site?"*
    - *"What is the protocol objective of CARDIO-2024?"*
 4. The AI returns an answer plus the source chunks it retrieved, with similarity scores
-
+d
 ### Step 5 — Explore trial data visually
 The **Trial Data** page has four tabs:
 - **Study Overview** — enrollment summary, subjects table, site distribution chart
@@ -555,9 +555,3 @@ Copy `.env.example` to `.env` and customise for your environment.
 - [ ] Role-based access control (site monitor vs sponsor vs CRO)
 
 ---
-
-## Acknowledgements
-
-Inspired by the [Production Agentic RAG Course](https://github.com/jamwithai/production-agentic-rag-course) architecture, adapted for clinical trial data management using Medidata Rave Web Services.
-
-Built with FastAPI, Streamlit, PostgreSQL, pgvector, and Ollama.

@@ -6,6 +6,7 @@ import json
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import opik
 
 from models_clinical import (
     ClinicalStudy, ClinicalSubject, ClinicalVisit,
@@ -62,6 +63,7 @@ def _upsert_chunk(
     )
 
 
+@opik.track(name="ingestion")
 def ingest_all(db: Session) -> int:
     """
     Build all text chunks from clinical data and embed them.
