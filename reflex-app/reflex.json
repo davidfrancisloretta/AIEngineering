@@ -1,0 +1,11 @@
+{
+  "app_name": "rave_ai",
+  "bun": true,
+  "web_dir": ".web",
+  "db_url": "sqlite:///reflex.db",
+  "env": "dev",
+  "loglevel": "info",
+  "api_url": "http://localhost:8000",
+  "frontend_packages": [],
+  "imports": []
+}

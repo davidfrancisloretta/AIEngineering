@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -65,11 +66,41 @@ with st.sidebar:
             except ApiError as e:
                 st.error(f"❌ {e}")
 
-    if st.button("🔍 Ingest for RAG", use_container_width=True, type="secondary"):
-        with st.spinner("Embedding clinical data for AI chat (~200 chunks)…"):
+    # ── Ingest for RAG with live progress bar ──────────────────────────────
+    if "ingest_running" not in st.session_state:
+        st.session_state["ingest_running"] = False
+
+    if st.session_state["ingest_running"]:
+        try:
+            ingest_st = client.rag_ingest_status()
+            s = ingest_st.get("status", "idle")
+            done  = ingest_st.get("done", 0)
+            total = max(ingest_st.get("total", 1), 1)
+
+            if s == "running":
+                pct = min(done / total, 0.99)
+                st.progress(pct, text=f"Embedding chunk {done} / {total}…")
+                time.sleep(2)
+                st.rerun()
+            elif s == "done":
+                chunks = ingest_st.get("chunks_created", 0)
+                st.success(f"✅ {chunks} chunks embedded and stored.")
+                st.session_state["ingest_running"] = False
+            elif s == "error":
+                st.error(f"❌ {ingest_st.get('error', 'Unknown error')}")
+                st.session_state["ingest_running"] = False
+            else:
+                st.session_state["ingest_running"] = False
+        except ApiError as e:
+            st.error(f"❌ {e}")
+            st.session_state["ingest_running"] = False
+    else:
+        if st.button("🔍 Ingest for RAG", use_container_width=True, type="secondary"):
             try:
-                r = client.rag_ingest()
-                st.success(f"✅ {r['message']}")
+                client.rag_ingest()
+                st.session_state["ingest_running"] = True
+                time.sleep(0.3)
+                st.rerun()
             except ApiError as e:
                 st.error(f"❌ {e}")
 

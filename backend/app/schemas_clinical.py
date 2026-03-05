@@ -108,6 +108,8 @@ class RAGStatusResponse(BaseModel):
     chunk_count:  int
     embed_model:  str
     llm_model:    str
+    embed_cache_hits: Optional[int] = None
+    embed_cache_size: Optional[int] = None
 
 
 # ── Text-to-SQL ────────────────────────────────────────────────────────────────
@@ -147,3 +149,41 @@ class ODMUploadResponse(BaseModel):
     forms:    int
     warnings: list[str] = []
     message:  str
+
+
+# ── Ingestion Status ─────────────────────────────────────────────────────────
+
+class RAGIngestStatusResponse(BaseModel):
+    status:         str            # idle | running | done | error
+    done:           int
+    total:          int
+    chunks_created: int
+    error:          Optional[str] = None
+
+
+# ── Analytics ────────────────────────────────────────────────────────────────
+
+class RAGAnalyticsSummary(BaseModel):
+    total_queries:   int
+    vector_queries:  int
+    sql_queries:     int
+    avg_response_ms: float
+    thumbs_up:       int
+    thumbs_down:     int
+    unrated:         int
+
+
+class RAGDailyStats(BaseModel):
+    day:        str
+    query_type: str
+    count:      int
+    avg_ms:     float
+
+
+class RAGTopQuestion(BaseModel):
+    question:   str
+    count:      int
+    avg_ms:     float
+    avg_s:      str  # formatted seconds (e.g., "1.23s")
+    thumbs_up:  int
+    thumbs_down: int

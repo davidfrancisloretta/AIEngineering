@@ -1,17 +1,23 @@
 import time
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
+from db import SessionLocal
 from dependencies import get_db, get_current_user
 from models import User
 from models_clinical import DocumentChunk, QueryLog
 from schemas_clinical import (
     RAGChatRequest,
     RAGChatResponse,
-    RAGIngestResponse,
+    RAGIngestStatusResponse,
     RAGStatusResponse,
+    RAGAnalyticsSummary,
+    RAGDailyStats,
+    RAGTopQuestion,
     SQLQueryRequest,
     SQLQueryResponse,
     FeedbackRequest,
@@ -20,35 +26,78 @@ import services.rag as rag_service
 import services.ingestion as ingestion_service
 import services.text_to_sql as text_to_sql_service
 import services.memory_service as memory_service
-from services.llm import ollama_ready, list_models, EMBED_MODEL, LLM_MODEL
+from services.llm import ollama_ready, list_models, EMBED_MODEL, LLM_MODEL, get_embed_cache_stats
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
+
+# ── Background ingestion state ─────────────────────────────────────────────────
+
+_ingest_state: dict = {
+    "status":         "idle",   # idle | running | done | error
+    "done":           0,
+    "total":          0,
+    "chunks_created": 0,
+    "error":          None,
+}
+_ingest_lock = threading.Lock()
+
+
+def _run_ingest(total_estimate: int) -> None:
+    """Runs in a daemon thread; creates its own DB session."""
+    global _ingest_state
+    db = SessionLocal()
+    try:
+        def _on_progress(done: int) -> None:
+            with _ingest_lock:
+                _ingest_state["done"] = done
+
+        count = ingestion_service.ingest_all(db, on_progress=_on_progress)
+        with _ingest_lock:
+            _ingest_state.update({
+                "status":         "done",
+                "done":           count,
+                "chunks_created": count,
+            })
+    except Exception as exc:
+        with _ingest_lock:
+            _ingest_state.update({"status": "error", "error": str(exc)})
+    finally:
+        db.close()
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.get("/status", response_model=RAGStatusResponse)
 def rag_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Check Ollama connectivity, available models, and current chunk count."""
+    """Check Ollama connectivity, available models, chunk count, and embedding cache stats."""
     chunk_count = db.query(DocumentChunk).count()
+    cache_stats = get_embed_cache_stats()
     return {
-        "ollama_ready": ollama_ready(),
-        "chunk_count":  chunk_count,
-        "embed_model":  EMBED_MODEL,
-        "llm_model":    LLM_MODEL,
+        "ollama_ready":       ollama_ready(),
+        "chunk_count":        chunk_count,
+        "embed_model":        EMBED_MODEL,
+        "llm_model":          LLM_MODEL,
+        "embed_cache_hits":   cache_stats["hits"],
+        "embed_cache_size":   cache_stats["currsize"],
     }
 
 
-@router.post("/ingest", response_model=RAGIngestResponse)
+@router.post("/ingest", response_model=RAGIngestStatusResponse)
 def ingest_clinical_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Embed all clinical trial data and store chunks in document_chunks.
-    Requires Ollama to be running and clinical data to be seeded first.
+    Start background ingestion of all clinical trial data.
+    Returns immediately with status="running".
+    Poll GET /rag/ingest-status for progress.
     """
+    global _ingest_state
+
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
@@ -57,11 +106,33 @@ def ingest_clinical_data(
                 "Wait for the ai_ollama container to finish downloading models."
             ),
         )
-    count = ingestion_service.ingest_all(db)
-    return {
-        "chunks_created": count,
-        "message": f"Ingestion complete — {count} chunks embedded and stored.",
-    }
+
+    with _ingest_lock:
+        if _ingest_state["status"] == "running":
+            return dict(_ingest_state)
+
+        total_estimate = ingestion_service.count_expected_chunks(db)
+        _ingest_state.update({
+            "status":         "running",
+            "done":           0,
+            "total":          total_estimate,
+            "chunks_created": 0,
+            "error":          None,
+        })
+
+    t = threading.Thread(target=_run_ingest, args=(total_estimate,), daemon=True)
+    t.start()
+
+    return dict(_ingest_state)
+
+
+@router.get("/ingest-status", response_model=RAGIngestStatusResponse)
+def ingest_status(
+    current_user: User = Depends(get_current_user),
+):
+    """Return the current state of a background ingestion job."""
+    with _ingest_lock:
+        return dict(_ingest_state)
 
 
 @router.post("/chat", response_model=RAGChatResponse)
@@ -117,7 +188,7 @@ def sql_query(
 ):
     """
     Text-to-SQL: question → llama3.2:3b → SQL → execute → LLM summary.
-    HealerAgent retries broken SQL up to 3 times. Query logged for feedback.
+    HealerAgent retries broken SQL up to 1 time. Query logged for feedback.
     """
     history = [msg.model_dump() for msg in body.history] if body.history else []
     t0 = time.monotonic()
@@ -194,3 +265,95 @@ def delete_memories(
     """Delete all Mem0 memories for the current user."""
     success = memory_service.delete_all_memories(current_user.id)
     return {"ok": success, "enabled": memory_service.is_enabled()}
+
+
+# ── Analytics endpoints ────────────────────────────────────────────────────────
+
+@router.get("/analytics/summary", response_model=RAGAnalyticsSummary)
+def analytics_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Aggregate totals across all query_logs: counts, avg response time, feedback."""
+    row = db.execute(text("""
+        SELECT
+            COUNT(*)                                                        AS total_queries,
+            SUM(CASE WHEN query_type = 'vector' THEN 1 ELSE 0 END)         AS vector_queries,
+            SUM(CASE WHEN query_type = 'sql'    THEN 1 ELSE 0 END)         AS sql_queries,
+            COALESCE(AVG(response_time_ms), 0)                             AS avg_response_ms,
+            SUM(CASE WHEN feedback =  1    THEN 1 ELSE 0 END)              AS thumbs_up,
+            SUM(CASE WHEN feedback = -1    THEN 1 ELSE 0 END)              AS thumbs_down,
+            SUM(CASE WHEN feedback IS NULL THEN 1 ELSE 0 END)              AS unrated
+        FROM query_logs
+    """)).fetchone()
+
+    return {
+        "total_queries":   row.total_queries   or 0,
+        "vector_queries":  row.vector_queries  or 0,
+        "sql_queries":     row.sql_queries     or 0,
+        "avg_response_ms": float(row.avg_response_ms or 0),
+        "thumbs_up":       row.thumbs_up       or 0,
+        "thumbs_down":     row.thumbs_down     or 0,
+        "unrated":         row.unrated         or 0,
+    }
+
+
+@router.get("/analytics/daily", response_model=list[RAGDailyStats])
+def analytics_daily(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-day query counts and avg response time for the last 14 days, split by query_type."""
+    rows = db.execute(text("""
+        SELECT
+            TO_CHAR(DATE(created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+            query_type,
+            COUNT(*)                                 AS count,
+            COALESCE(AVG(response_time_ms), 0)       AS avg_ms
+        FROM  query_logs
+        WHERE created_at >= NOW() - INTERVAL '14 days'
+        GROUP BY day, query_type
+        ORDER BY day, query_type
+    """)).fetchall()
+
+    return [
+        {
+            "day":        row.day,
+            "query_type": row.query_type,
+            "count":      row.count,
+            "avg_ms":     float(row.avg_ms),
+        }
+        for row in rows
+    ]
+
+
+@router.get("/analytics/top-questions", response_model=list[RAGTopQuestion])
+def analytics_top_questions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Top 10 most-asked questions with counts, avg response time, and feedback tallies."""
+    rows = db.execute(text("""
+        SELECT
+            question,
+            COUNT(*)                                                    AS count,
+            COALESCE(AVG(response_time_ms), 0)                         AS avg_ms,
+            SUM(CASE WHEN feedback =  1 THEN 1 ELSE 0 END)             AS thumbs_up,
+            SUM(CASE WHEN feedback = -1 THEN 1 ELSE 0 END)             AS thumbs_down
+        FROM  query_logs
+        GROUP BY question
+        ORDER BY count DESC
+        LIMIT 10
+    """)).fetchall()
+
+    return [
+        {
+            "question":   row.question,
+            "count":      row.count,
+            "avg_ms":     float(row.avg_ms),
+            "avg_s":      f"{float(row.avg_ms) / 1000:.2f}s" if row.avg_ms > 0 else "—",
+            "thumbs_up":  row.thumbs_up  or 0,
+            "thumbs_down": row.thumbs_down or 0,
+        }
+        for row in rows
+    ]

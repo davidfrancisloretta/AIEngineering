@@ -26,7 +26,7 @@ log = logging.getLogger("text_to_sql")
 OLLAMA_BASE       = os.getenv("OLLAMA_URL", "http://ollama:11434")
 SQL_MODEL         = os.getenv("OLLAMA_SQL_MODEL", "llama3.2:3b")
 MAX_ROWS          = 100
-MAX_HEAL_ATTEMPTS = 3   # HealerAgent: max retries on SQL execution error
+MAX_HEAL_ATTEMPTS = 1   # HealerAgent: max retries — keep low to avoid CPU timeout
 
 
 # ── SQL Views ──────────────────────────────────────────────────────────────────
@@ -143,22 +143,45 @@ VIEWS (prefer these for analysis):
 
 CRITICAL RULES — violating these causes errors:
   1. ONLY use the 4 tables and 4 views listed above. There is NO 'sites' table, NO 'patients'
-     table, NO 'enrollment' table. Do not invent table names.
-  2. clinical_visits does NOT have a subject_key column. To filter by subject_key or site_name,
-     JOIN clinical_visits to clinical_subjects: JOIN clinical_subjects s ON s.id = v.subject_id
-  3. To filter by site name, use: WHERE clinical_subjects.site_name = 'London'
-     NOT: WHERE site_id = (SELECT site_id FROM sites ...)  — the 'sites' table does not exist.
-  4. Write a single SELECT query only. Add LIMIT {max_rows} unless user asks for counts/aggregates.
-  5. Use v_form_items for Rave data (B_Demostudy). subject_key there is a UUID.
+     table, NO 'enrollment' table, NO 'v_site_names' view. Do not invent table or view names.
+  2. clinical_visits does NOT have a subject_key column. JOIN to clinical_subjects to get it.
+  3. To filter by site, use clinical_subjects.site_name directly — no subquery needed.
+  4. Use descriptive aliases only: s=clinical_subjects, v=clinical_visits, cs=clinical_studies,
+     f=clinical_forms. NEVER use T1/T2/T3 style aliases.
+  5. Always qualify column names with their alias when joining tables.
+  6. Write a single SELECT query only. Add LIMIT {max_rows} unless counting/aggregating.
+  7. Use v_form_items for Rave data (B_Demostudy).
 
-EXAMPLE — subjects at a named site:
-  SELECT COUNT(*) FROM clinical_subjects WHERE site_name = 'London';
+EXAMPLES (follow these patterns exactly):
 
-EXAMPLE — subjects enrolled in a study at a site:
-  SELECT s.subject_key, s.site_name
-  FROM clinical_subjects s
-  JOIN clinical_studies cs ON cs.id = s.study_id
-  WHERE s.site_name = 'London' LIMIT {max_rows};
+-- Subjects per site:
+SELECT site_name, COUNT(*) AS subject_count
+FROM clinical_subjects
+GROUP BY site_name ORDER BY subject_count DESC;
+
+-- Subjects at a specific site:
+SELECT COUNT(*) FROM clinical_subjects WHERE site_name = 'London';
+
+-- Subjects with site, joined to study:
+SELECT s.subject_key, s.site_name, cs.study_oid
+FROM clinical_subjects s
+JOIN clinical_studies cs ON cs.id = s.study_id
+WHERE s.site_name = 'London' LIMIT {max_rows};
+
+-- Visits for a subject (join pattern):
+SELECT s.subject_key, v.visit_name, v.visit_date
+FROM clinical_visits v
+JOIN clinical_subjects s ON s.id = v.subject_id
+WHERE s.site_name = 'London' LIMIT {max_rows};
+
+-- Adverse events summary:
+SELECT ae_term, severity, COUNT(*) AS count
+FROM v_adverse_events
+GROUP BY ae_term, severity ORDER BY count DESC;
+
+-- Vital signs average:
+SELECT site_name, ROUND(AVG(heart_rate),1) AS avg_hr
+FROM v_vital_signs GROUP BY site_name;
 """.format(max_rows=MAX_ROWS)
 
 
@@ -234,6 +257,21 @@ def _is_safe(sql: str) -> bool:
     return not any(f" {kw} " in f" {upper} " for kw in dangerous)
 
 
+_KNOWN_RELATIONS = {
+    "clinical_studies", "clinical_subjects", "clinical_visits", "clinical_forms",
+    "v_form_items", "v_vital_signs", "v_adverse_events", "v_lab_results",
+}
+
+def _unknown_tables(sql: str) -> list[str]:
+    """
+    Return any table/view names referenced in FROM or JOIN clauses that are
+    not in the known schema. Catches hallucinated tables before DB execution.
+    """
+    # Extract words after FROM or JOIN keywords
+    tokens = re.findall(r"(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql, re.IGNORECASE)
+    return [t for t in tokens if t.lower() not in _KNOWN_RELATIONS]
+
+
 # ── Ollama calls ───────────────────────────────────────────────────────────────
 
 @opik.track(name="ollama_sql_generate")
@@ -242,6 +280,11 @@ def _ollama_generate(prompt: str, system: str = "") -> str:
         "model":  SQL_MODEL,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_ctx":     2048,  # reduce context from default 8192 — big CPU saving
+            "num_predict": 300,   # SQL rarely exceeds 300 tokens
+            "temperature": 0.1,   # low temp = more deterministic SQL
+        },
     }
     if system:
         payload["system"] = system
@@ -384,6 +427,28 @@ def sql_chat(
     rows: list[list] = []
 
     for attempt in range(MAX_HEAL_ATTEMPTS + 1):
+        # Pre-execution check: catch hallucinated tables before hitting the DB
+        bad_tables = _unknown_tables(generated_sql)
+        if bad_tables:
+            error_str = (
+                f"Query references unknown table(s): {', '.join(bad_tables)}. "
+                f"Only use: {', '.join(sorted(_KNOWN_RELATIONS))}."
+            )
+            if attempt < MAX_HEAL_ATTEMPTS:
+                heal_attempts += 1
+                log.warning("Pre-exec validator caught unknown tables %s — HealerAgent activating.", bad_tables)
+                healed_sql = _heal_sql(generated_sql, error_str, question)
+                if _is_safe(healed_sql):
+                    generated_sql = healed_sql
+                    continue
+                else:
+                    raise ValueError(f"HealerAgent produced an unsafe SQL statement:\n{healed_sql}")
+            else:
+                raise ValueError(
+                    f"SQL references unknown tables after {heal_attempts} healing attempt(s): "
+                    f"{bad_tables}\n\nFinal SQL:\n{generated_sql}"
+                )
+
         try:
             result  = db.execute(text(generated_sql))
             columns = list(result.keys())

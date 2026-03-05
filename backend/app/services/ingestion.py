@@ -63,8 +63,16 @@ def _upsert_chunk(
     )
 
 
+def count_expected_chunks(db: Session) -> int:
+    """Estimate the total number of chunks ingest_all() will create (lower bound)."""
+    studies  = db.query(ClinicalStudy).count()
+    subjects = db.query(ClinicalSubject).count()
+    visits   = db.query(ClinicalVisit).count()
+    return max(studies + subjects + int(visits * 2.5), 1)
+
+
 @opik.track(name="ingestion")
-def ingest_all(db: Session) -> int:
+def ingest_all(db: Session, on_progress=None) -> int:
     """
     Build all text chunks from clinical data and embed them.
     Returns the total number of chunks created.
@@ -92,6 +100,8 @@ def ingest_all(db: Session) -> int:
         _upsert_chunk(db, "study", study.id, text_study,
                       {"study_oid": study.study_oid})
         count += 1
+        if on_progress:
+            on_progress(count)
 
         subjects = (
             db.query(ClinicalSubject)
@@ -113,6 +123,8 @@ def ingest_all(db: Session) -> int:
                            "subject_key": subj.subject_key,
                            "site": subj.site_name})
             count += 1
+            if on_progress:
+                on_progress(count)
 
             visits = (
                 db.query(ClinicalVisit)
@@ -153,6 +165,8 @@ def ingest_all(db: Session) -> int:
                                "visit_name": visit.visit_name,
                                "visit_date": str(visit.visit_date)})
                 count += 1
+                if on_progress:
+                    on_progress(count)
 
                 # ── Adverse event chunks (one per event) ──────────────────────
                 ae_events = form_data.get("AE", {}).get("events", [])
@@ -177,6 +191,8 @@ def ingest_all(db: Session) -> int:
                          "ae_severity":  ae.get("severity")},
                     )
                     count += 1
+                    if on_progress:
+                        on_progress(count)
 
                 # ── Abnormal lab chunk (one per visit if any abnormals) ────────
                 lb_results = form_data.get("LB", {}).get("results", [])
@@ -200,6 +216,8 @@ def ingest_all(db: Session) -> int:
                          "visit_name":  visit.visit_name},
                     )
                     count += 1
+                    if on_progress:
+                        on_progress(count)
 
     db.commit()
     return count

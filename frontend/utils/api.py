@@ -193,8 +193,18 @@ class ApiClient:
         return resp.json()
 
     def rag_ingest(self) -> dict:
+        """Fire background ingestion. Returns immediately with status='running'."""
         resp = requests.post(
-            f"{API_BASE}/rag/ingest", headers=self._headers, timeout=300
+            f"{API_BASE}/rag/ingest", headers=self._headers, timeout=30
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def rag_ingest_status(self) -> dict:
+        """Poll the current state of a background ingestion job."""
+        resp = requests.get(
+            f"{API_BASE}/rag/ingest-status", headers=self._headers, timeout=10
         )
         if not resp.ok:
             _raise(resp)
@@ -273,6 +283,33 @@ class ApiClient:
         """Delete all Mem0 memories for the current user."""
         resp = requests.delete(
             f"{API_BASE}/rag/memories", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    # --------------------------------------------------
+    # RAG Analytics
+    # --------------------------------------------------
+    def get_rag_analytics_summary(self) -> dict:
+        resp = requests.get(
+            f"{API_BASE}/rag/analytics/summary", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def get_rag_analytics_daily(self) -> list:
+        resp = requests.get(
+            f"{API_BASE}/rag/analytics/daily", headers=self._headers, timeout=15
+        )
+        if not resp.ok:
+            _raise(resp)
+        return resp.json()
+
+    def get_rag_analytics_top_questions(self) -> list:
+        resp = requests.get(
+            f"{API_BASE}/rag/analytics/top-questions", headers=self._headers, timeout=15
         )
         if not resp.ok:
             _raise(resp)

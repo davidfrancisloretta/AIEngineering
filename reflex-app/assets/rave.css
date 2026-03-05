@@ -1,0 +1,51 @@
+/* RAVE AI — Custom animations */
+
+/* Animated thinking dots for AI Chat */
+@keyframes raveDotPulse {
+  0%, 80%, 100% {
+    transform: scale(0.6);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.rave-dot {
+  animation: raveDotPulse 1.4s ease-in-out infinite;
+}
+.rave-dot-1 { animation-delay: 0s; }
+.rave-dot-2 { animation-delay: 0.2s; }
+.rave-dot-3 { animation-delay: 0.4s; }
+
+/* Animated progress sweep for thinking state */
+@keyframes raveProgressSweep {
+  0%   { width: 0%;   opacity: 1; }
+  60%  { width: 85%;  opacity: 0.9; }
+  100% { width: 100%; opacity: 0.5; }
+}
+
+.rave-progress-fill {
+  animation: raveProgressSweep 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Page transition fade */
+@keyframes raveFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.rave-fade-in {
+  animation: raveFadeIn 0.2s ease-out forwards;
+}
+
+/* Button loading pulse */
+@keyframes raveButtonPulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.7; }
+}
+
+.rave-btn-loading {
+  animation: raveButtonPulse 1.2s ease-in-out infinite;
+}

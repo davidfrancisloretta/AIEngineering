@@ -5,6 +5,7 @@ Uses the existing 'requests' library (sync) to match the rest of the service lay
 import os
 import json
 from typing import Generator
+from functools import lru_cache
 import requests
 import opik
 from opik import opik_context
@@ -14,11 +15,12 @@ EMBED_MODEL  = os.getenv("OLLAMA_EMBED_MODEL",  "nomic-embed-text")
 LLM_MODEL    = os.getenv("OLLAMA_LLM_MODEL",    "tinyllama")
 
 
+@lru_cache(maxsize=512)
 @opik.track(name="ollama_embed")
 def embed_text(text: str) -> list[float]:
     """
     Embed a text string via Ollama nomic-embed-text.
-    Returns a list of 768 floats.
+    Returns a list of 768 floats (LRU cached for repeated queries).
     Raises requests.HTTPError on failure.
     """
     resp = requests.post(
@@ -41,6 +43,10 @@ def generate_text(prompt: str, system: str = "") -> str:
         "model":  LLM_MODEL,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_ctx":     2048,
+            "num_predict": 512,
+        },
     }
     if system:
         payload["system"] = system
@@ -66,6 +72,10 @@ def stream_generate_text(prompt: str, system: str = "") -> Generator[str, None, 
         "model":  LLM_MODEL,
         "prompt": prompt,
         "stream": True,
+        "options": {
+            "num_ctx":     2048,
+            "num_predict": 512,
+        },
     }
     if system:
         payload["system"] = system
@@ -107,3 +117,14 @@ def list_models() -> list[str]:
         return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         return []
+
+
+def get_embed_cache_stats() -> dict:
+    """Return embedding cache performance stats (hits, misses, size)."""
+    info = embed_text.cache_info()
+    return {
+        "hits":      info.hits,
+        "misses":    info.misses,
+        "maxsize":   info.maxsize,
+        "currsize":  info.currsize,
+    }

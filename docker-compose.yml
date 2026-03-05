@@ -30,6 +30,26 @@ services:
       - API_URL=http://backend:8000
     ports:
       - "8501:8501"
+    profiles:
+      - legacy
+
+  reflex:
+    build: ./reflex-app
+    container_name: rave_reflex
+    restart: on-failure
+    depends_on:
+      - backend
+    environment:
+      - FASTAPI_URL=http://backend:8000
+      - REFLEX_ENV=dev
+      - REFLEX_HOST=0.0.0.0
+      - REFLEX_PORT=3000
+    ports:
+      - "3000:3000"
+      - "8001:8001"
+    volumes:
+      - ./reflex-app:/app
+      - reflex_cache:/.reflex
 
   db:
     image: pgvector/pgvector:pg15
@@ -52,6 +72,10 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: ai_ollama
+    environment:
+      - OLLAMA_NUM_THREAD=4          # cap CPU threads (was using all cores)
+      - OLLAMA_MAX_LOADED_MODELS=1   # keep only 1 model in RAM at a time
+      - OLLAMA_FLASH_ATTENTION=1     # faster attention on CPU
     ports:
       - "11434:11434"
     volumes:
@@ -75,3 +99,4 @@ services:
 volumes:
   pg_data:
   ollama_data:
+  reflex_cache:

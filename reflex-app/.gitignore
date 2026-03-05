@@ -1,0 +1,38 @@
+.states
+assets/external/
+# Build
+# Environment
+# IDE
+# OS
+# Python
+# Reflex
+# Testing
+*$py.class
+*.db
+*.egg-info/
+*.py[cod]
+*.so
+*.swo
+*.swp
+*~
+.DS_Store
+.Python
+.coverage
+.env
+.env.*.local
+.env.local
+.idea/
+.pytest_cache/
+.reflex/
+.vscode/
+.web
+.web/
+ENV/
+Thumbs.db
+__pycache__/
+build/
+dist/
+env/
+htmlcov/
+reflex.db
+venv/
