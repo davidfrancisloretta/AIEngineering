@@ -60,7 +60,7 @@ def fetch_data_page() -> rx.Component:
             rx.vstack(
                 rx.text("Fetch Data", font_family=T.FONT_MONO,
                         font_size="24px", font_weight="700", color=T.FG),
-                rx.text("Import ODM XML files or manage clinical trial data",
+                rx.text("Configure your Medidata API key and import clinical trial data",
                         font_family=T.FONT_BODY, font_size="14px", color=T.MUTED_FG),
                 spacing="1", align="start",
             ),
@@ -72,6 +72,174 @@ def fetch_data_page() -> rx.Component:
 
         rx.box(
             rx.vstack(
+
+                # ── Medidata API Key Card ──────────────────────────────
+                rx.box(
+                    rx.vstack(
+                        rx.hstack(
+                            rx.box(
+                                rx.text("🔑", font_size="18px"),
+                                width="36px", height="36px",
+                                border_radius=T.RADIUS_S,
+                                background_color=f"{T.PRIMARY}15",
+                                border=f"1px solid {T.PRIMARY}30",
+                                display="flex", align_items="center",
+                                justify_content="center",
+                            ),
+                            rx.vstack(
+                                rx.text("Medidata Rave API Key",
+                                        font_family=T.FONT_MONO, font_size="16px",
+                                        font_weight="600", color=T.FG),
+                                rx.text(
+                                    "Connect to your Medidata Rave environment to fetch clinical data "
+                                    "directly via ODM or YAML export",
+                                    font_family=T.FONT_BODY, font_size="13px",
+                                    color=T.MUTED_FG,
+                                ),
+                                spacing="1", align="start",
+                            ),
+                            spacing="3", align="center", width="100%",
+                        ),
+
+                        rx.box(height="1px", background_color=T.BORDER, width="100%"),
+
+                        # API Key input row
+                        rx.vstack(
+                            rx.text("API Key", font_family=T.FONT_MONO,
+                                    font_size="12px", font_weight="600",
+                                    color=T.MUTED_FG, letter_spacing="0.05em"),
+                            rx.hstack(
+                                rx.input(
+                                    placeholder="Enter your Medidata API key…",
+                                    value=OdmUploadState.medi_api_key,
+                                    on_change=OdmUploadState.set_medi_api_key,
+                                    type=rx.cond(OdmUploadState.medi_show_key, "text", "password"),
+                                    font_family=T.FONT_MONO,
+                                    font_size="13px",
+                                    height="42px",
+                                    width="100%",
+                                    padding="0 14px",
+                                    border_radius=T.RADIUS_S,
+                                    border=f"1px solid {T.BORDER}",
+                                    background_color=T.BACKGROUND,
+                                    _focus={"border_color": T.PRIMARY,
+                                            "outline": "none",
+                                            "box_shadow": f"0 0 0 3px {T.PRIMARY}22"},
+                                    _placeholder={"color": T.MUTED_FG},
+                                ),
+                                rx.button(
+                                    rx.cond(OdmUploadState.medi_show_key,
+                                            rx.text("Hide", font_family=T.FONT_MONO, font_size="12px"),
+                                            rx.text("Show", font_family=T.FONT_MONO, font_size="12px")),
+                                    on_click=OdmUploadState.toggle_medi_show_key,
+                                    height="42px", padding="0 16px",
+                                    border_radius=T.RADIUS_S,
+                                    variant="outline",
+                                    border=f"1px solid {T.BORDER}",
+                                    color=T.MUTED_FG,
+                                    cursor="pointer",
+                                    _hover={"border_color": T.PRIMARY, "color": T.PRIMARY},
+                                ),
+                                width="100%", spacing="2",
+                            ),
+                            spacing="2", width="100%",
+                        ),
+
+                        # Environment info row
+                        rx.hstack(
+                            rx.hstack(
+                                rx.box(width="6px", height="6px", border_radius="50%",
+                                       background_color=rx.cond(
+                                           OdmUploadState.medi_api_key_saved,
+                                           T.SUCCESS, T.MUTED_FG),
+                                       flex_shrink="0"),
+                                rx.text(
+                                    rx.cond(OdmUploadState.medi_api_key_saved,
+                                            "Connected", "Not connected"),
+                                    font_family=T.FONT_MONO, font_size="12px",
+                                    color=rx.cond(OdmUploadState.medi_api_key_saved,
+                                                  "#004D1A", T.MUTED_FG)),
+                                spacing="2", align="center",
+                            ),
+                            rx.spacer(),
+                            rx.hstack(
+                                rx.button(
+                                    rx.text("Clear", font_family=T.FONT_MONO,
+                                            font_size="13px"),
+                                    on_click=OdmUploadState.clear_medi_api_key,
+                                    height="36px", padding="0 18px",
+                                    border_radius=T.RADIUS_PILL,
+                                    variant="outline",
+                                    border=f"1px solid {T.BORDER}",
+                                    color=T.MUTED_FG,
+                                    cursor="pointer",
+                                    _hover={"border_color": T.PRIMARY, "color": T.PRIMARY},
+                                ),
+                                rx.button(
+                                    rx.text("Save & Connect", font_family=T.FONT_MONO,
+                                            font_size="13px"),
+                                    on_click=OdmUploadState.save_medi_api_key,
+                                    height="36px", padding="0 22px",
+                                    border_radius=T.RADIUS_PILL,
+                                    background_color=T.PRIMARY,
+                                    color=T.PRIMARY_FG,
+                                    cursor="pointer",
+                                    _hover={"background_color": T.PRIMARY_HOVER},
+                                    style={"boxShadow": T.SHADOW_PRIMARY},
+                                ),
+                                spacing="2",
+                            ),
+                            width="100%", align="center",
+                        ),
+
+                        # Success
+                        rx.cond(
+                            OdmUploadState.medi_api_key_saved,
+                            rx.box(
+                                rx.hstack(
+                                    rx.text("✅", font_size="14px"),
+                                    rx.text("API key saved — Medidata Rave connection active. "
+                                            "You can now import ODM/YAML files below.",
+                                            font_family=T.FONT_BODY, font_size="13px",
+                                            color="#004D1A", font_weight="500"),
+                                    spacing="2", align="center",
+                                ),
+                                padding="12px 16px",
+                                background_color="#DFE6E1",
+                                border_radius=T.RADIUS_S,
+                                border="1px solid #A0C4A0",
+                                width="100%",
+                            ),
+                        ),
+
+                        # Error
+                        rx.cond(
+                            OdmUploadState.medi_api_key_error != "",
+                            rx.box(
+                                rx.hstack(
+                                    rx.text("⚠️", font_size="14px"),
+                                    rx.text(OdmUploadState.medi_api_key_error,
+                                            font_family=T.FONT_BODY, font_size="13px",
+                                            color=T.ERROR_FG),
+                                    spacing="2", align="center",
+                                ),
+                                padding="12px 16px",
+                                background_color=T.ERROR_BG,
+                                border_radius=T.RADIUS_S,
+                                border="1px solid #D4A0A0",
+                                width="100%",
+                            ),
+                        ),
+
+                        spacing="4", width="100%", align="start",
+                    ),
+                    padding="24px 28px",
+                    background_color=T.CARD,
+                    border=f"1px solid {T.BORDER}",
+                    border_radius=T.RADIUS_M,
+                    width="100%",
+                    style={"boxShadow": T.SHADOW_SM},
+                ),
 
                 # ── ODM Import Card ─────────────────────────────────────
                 rx.box(
@@ -260,7 +428,7 @@ def fetch_data_page() -> rx.Component:
                                             font_size="13px", color=T.FG),
                                     spacing="2", align="start",
                                 ) for step in [
-                                    "Import an ODM file here — or use Seed Demo Data for synthetic data",
+                                    "Enter your Medidata Rave API key to connect, then import an ODM/YAML file — or use Seed Demo Data",
                                     "Then Ingest for RAG to enable AI vector search",
                                     "Browse subjects in Trial Data",
                                     "Ask questions in AI Chat",

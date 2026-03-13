@@ -1,3 +1,4 @@
+import os
 import reflex as rx
 
 config = rx.Config(
@@ -6,5 +7,8 @@ config = rx.Config(
     # Must be a URL reachable from the user's browser (not internal Docker hostname).
     api_url="http://localhost:8001",
     backend_port=8001,
+    backend_host="0.0.0.0",
+    frontend_port=3000,
+    frontend_host="0.0.0.0",
     stylesheets=["rave.css"],
 )

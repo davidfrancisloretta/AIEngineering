@@ -180,11 +180,11 @@ class ApiClient:
         return await self._request("GET", "/rag/ingest-status")
 
     async def rag_chat(self, question: str, top_k: int = 5) -> Dict:
-        """Non-streaming RAG chat"""
+        """Non-streaming RAG chat. Extended timeout for first call (model download)."""
         return await self._request("POST", "/rag/chat", {
             "question": question,
             "top_k": top_k
-        })
+        }, timeout=300)
 
     async def rag_chat_stream(self, question: str, top_k: int = 5):
         """Streaming RAG chat (yields tokens)"""

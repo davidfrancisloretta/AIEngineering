@@ -680,6 +680,40 @@ class OdmUploadState(AppState):
     upload_result: str = ""
     selected_filename: str = ""
 
+    # Medidata API Key
+    medi_api_key: str = ""
+    medi_api_key_saved: bool = False
+    medi_api_key_error: str = ""
+    medi_show_key: bool = False
+
+    def set_medi_api_key(self, value: str):
+        self.medi_api_key = value
+        self.medi_api_key_saved = False
+        self.medi_api_key_error = ""
+
+    def toggle_medi_show_key(self):
+        self.medi_show_key = not self.medi_show_key
+
+    def save_medi_api_key(self):
+        """Validate and save the Medidata API key"""
+        key = self.medi_api_key.strip()
+        if not key:
+            self.medi_api_key_error = "API key cannot be empty"
+            self.medi_api_key_saved = False
+            return
+        if len(key) < 8:
+            self.medi_api_key_error = "API key seems too short — please check your key"
+            self.medi_api_key_saved = False
+            return
+        self.medi_api_key = key
+        self.medi_api_key_saved = True
+        self.medi_api_key_error = ""
+
+    def clear_medi_api_key(self):
+        self.medi_api_key = ""
+        self.medi_api_key_saved = False
+        self.medi_api_key_error = ""
+
     async def handle_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
