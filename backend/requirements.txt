@@ -15,5 +15,6 @@ pandas
 openpyxl
 xlrd
 pgvector
-mem0ai
 opik
+redis>=5.0
+sentence-transformers

@@ -6,6 +6,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       ollama:
         condition: service_started
     environment:
@@ -15,7 +17,7 @@ services:
       - OLLAMA_EMBED_MODEL=nomic-embed-text
       - OLLAMA_LLM_MODEL=tinyllama
       - OLLAMA_SQL_MODEL=llama3.2:3b
-      - MEM0_API_KEY=${MEM0_API_KEY:-}
+      - REDIS_URL=redis://redis:6379/0
       - OPIK_API_KEY=${OPIK_API_KEY:-}
       - OPIK_PROJECT_NAME=rave-analytics-rag
     ports:
@@ -51,8 +53,22 @@ services:
       - ./reflex-app:/app
       - reflex_cache:/.reflex
 
+  redis:
+    image: redis:7-alpine
+    container_name: ai_redis
+    restart: on-failure
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   db:
-    image: pgvector/pgvector:pg15
+    image: paradedb/paradedb:latest
     container_name: analytics_db
     environment:
       POSTGRES_USER: postgres
@@ -61,7 +77,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d analytics"]
       interval: 5s
@@ -99,4 +115,5 @@ services:
 volumes:
   pg_data:
   ollama_data:
+  redis_data:
   reflex_cache:
