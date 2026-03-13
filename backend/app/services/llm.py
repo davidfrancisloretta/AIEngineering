@@ -1,36 +1,49 @@
 """
 Ollama HTTP client for embeddings and text generation.
 Uses the existing 'requests' library (sync) to match the rest of the service layer.
+Embeddings are cached via the L1+L2 Redis cache (survives restarts).
 """
 import os
 import json
 from typing import Generator
-from functools import lru_cache
 import requests
 import opik
 from opik import opik_context
+
+from services.cache import cache_key, get_or_compute, get_cache_stats
 
 OLLAMA_BASE  = os.getenv("OLLAMA_URL",          "http://ollama:11434")
 EMBED_MODEL  = os.getenv("OLLAMA_EMBED_MODEL",  "nomic-embed-text")
 LLM_MODEL    = os.getenv("OLLAMA_LLM_MODEL",    "tinyllama")
 
 
-@lru_cache(maxsize=512)
-@opik.track(name="ollama_embed")
-def embed_text(text: str) -> list[float]:
-    """
-    Embed a text string via Ollama nomic-embed-text.
-    Returns a list of 768 floats (LRU cached for repeated queries).
-    Raises requests.HTTPError on failure.
-    """
+def _embed_from_ollama(text: str) -> list[float]:
+    """Call Ollama embedding API directly."""
     resp = requests.post(
         f"{OLLAMA_BASE}/api/embeddings",
         json={"model": EMBED_MODEL, "prompt": text},
         timeout=60,
     )
     resp.raise_for_status()
-    opik_context.update_current_span(metadata={"model": EMBED_MODEL, "input_length": len(text)})
     return resp.json()["embedding"]
+
+
+@opik.track(name="ollama_embed")
+def embed_text(text: str) -> list[float]:
+    """
+    Embed a text string via Ollama nomic-embed-text.
+    Returns a list of 768 floats.
+    Cached in L1 (in-process) + L2 (Redis) — survives restarts.
+    """
+    key = cache_key("embed", text.strip().lower())
+    result = get_or_compute(
+        key,
+        lambda: _embed_from_ollama(text),
+        ttl=86400,         # 24h — embeddings are deterministic for same model
+        stale_ttl=604800,  # 7-day stale fallback if Ollama is down
+    )
+    opik_context.update_current_span(metadata={"model": EMBED_MODEL, "input_length": len(text)})
+    return result
 
 
 @opik.track(name="ollama_generate")
@@ -120,11 +133,13 @@ def list_models() -> list[str]:
 
 
 def get_embed_cache_stats() -> dict:
-    """Return embedding cache performance stats (hits, misses, size)."""
-    info = embed_text.cache_info()
+    """Return embedding cache performance stats (L1+L2 combined)."""
+    stats = get_cache_stats()
     return {
-        "hits":      info.hits,
-        "misses":    info.misses,
-        "maxsize":   info.maxsize,
-        "currsize":  info.currsize,
+        "hits":      stats["l1_hits"] + stats["l2_hits"],
+        "misses":    stats["misses"],
+        "maxsize":   stats["l1_max"],
+        "currsize":  stats["l1_size"],
+        "redis_connected": stats["redis_connected"],
+        "stale_served":    stats["stale_served"],
     }

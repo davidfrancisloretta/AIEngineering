@@ -1,8 +1,12 @@
 """
 Ingestion service: builds text chunks from the clinical database,
 embeds them via Ollama, and stores them in document_chunks for RAG retrieval.
+
+Auto-vectorization: process_pending() drains the pending_ingestion queue
+populated by Postgres triggers on clinical tables.
 """
 import json
+import logging
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -13,6 +17,8 @@ from models_clinical import (
     ClinicalForm, DocumentChunk,
 )
 from services.llm import embed_text
+
+log = logging.getLogger("ingestion")
 
 
 def _vector_literal(embedding: list[float]) -> str:
@@ -221,3 +227,164 @@ def ingest_all(db: Session, on_progress=None) -> int:
 
     db.commit()
     return count
+
+
+# ── Auto-vectorization: drain pending_ingestion queue ─────────────────────────
+
+def _chunk_subject(db: Session, row_id: int) -> None:
+    """Re-chunk a single clinical subject by id."""
+    subj: ClinicalSubject | None = db.query(ClinicalSubject).get(row_id)
+    if not subj:
+        return
+    study: ClinicalStudy | None = db.query(ClinicalStudy).get(subj.study_id)
+    study_oid: str = study.study_oid if study else "unknown"
+
+    chunk_text: str = (
+        f"Subject {subj.subject_key} enrolled in study {study_oid}. "
+        f"Site: {subj.site_name} ({subj.site_id}). "
+        f"Age: {subj.age} years, Sex: {subj.sex}, Race: {subj.race}. "
+        f"Enrollment date: {subj.enrollment_date}. "
+        f"Subject status: {subj.status}."
+    )
+    _upsert_chunk(db, "subject", subj.id, chunk_text,
+                  {"study_oid": study_oid,
+                   "subject_key": subj.subject_key,
+                   "site": subj.site_name})
+
+
+def _chunk_visit(db: Session, row_id: int) -> None:
+    """Re-chunk a single visit (including vitals, AEs, and labs)."""
+    visit: ClinicalVisit | None = db.query(ClinicalVisit).get(row_id)
+    if not visit:
+        return
+    subj: ClinicalSubject | None = db.query(ClinicalSubject).get(visit.subject_id)
+    if not subj:
+        return
+    study: ClinicalStudy | None = db.query(ClinicalStudy).get(subj.study_id)
+    study_oid: str = study.study_oid if study else "unknown"
+
+    forms = db.query(ClinicalForm).filter(ClinicalForm.visit_id == visit.id).all()
+    form_data: dict = {
+        f.form_oid: json.loads(f.data_json)
+        for f in forms if f.data_json
+    }
+
+    # Visit / vitals chunk
+    vs: dict = form_data.get("VS", {})
+    text_visit: str = (
+        f"Subject {subj.subject_key} attended visit '{visit.visit_name}' "
+        f"on {visit.visit_date} at {subj.site_name}. "
+        f"Visit status: {visit.status}. "
+    )
+    if vs:
+        text_visit += (
+            f"Vital signs recorded: "
+            f"heart rate {vs.get('heart_rate')} bpm, "
+            f"blood pressure {vs.get('systolic_bp')}/{vs.get('diastolic_bp')} mmHg, "
+            f"temperature {vs.get('temperature')} C, "
+            f"weight {vs.get('weight')} kg, "
+            f"height {vs.get('height')} cm."
+        )
+    _upsert_chunk(db, "visit", visit.id, text_visit,
+                  {"study_oid": study_oid,
+                   "subject_key": subj.subject_key,
+                   "visit_name": visit.visit_name,
+                   "visit_date": str(visit.visit_date)})
+
+    # AE chunks
+    ae_events: list = form_data.get("AE", {}).get("events", [])
+    for ae_idx, ae in enumerate(ae_events):
+        text_ae: str = (
+            f"Adverse event reported for subject {subj.subject_key} "
+            f"at visit '{visit.visit_name}' ({visit.visit_date}): "
+            f"{ae.get('term')}. "
+            f"Severity: {ae.get('severity')}. "
+            f"Relationship to study drug: {ae.get('relationship')}. "
+            f"Outcome: {ae.get('outcome')}."
+        )
+        _upsert_chunk(db, "adverse_event", visit.id * 100 + ae_idx, text_ae,
+                      {"study_oid": study_oid,
+                       "subject_key": subj.subject_key,
+                       "visit_name": visit.visit_name,
+                       "ae_term": ae.get("term"),
+                       "ae_severity": ae.get("severity")})
+
+    # Abnormal lab chunk
+    lb_results: list = form_data.get("LB", {}).get("results", [])
+    abnormal: list = [r for r in lb_results if r.get("flag") not in ("N", None)]
+    if abnormal:
+        lab_lines: str = ", ".join(
+            f"{r['name']} {r['value']} {r['unit']} (flag: {r['flag']})"
+            for r in abnormal
+        )
+        text_lab: str = (
+            f"Abnormal laboratory results for subject {subj.subject_key} "
+            f"at visit '{visit.visit_name}' ({visit.visit_date}): "
+            f"{lab_lines}."
+        )
+        _upsert_chunk(db, "lab", visit.id * 1000, text_lab,
+                      {"study_oid": study_oid,
+                       "subject_key": subj.subject_key,
+                       "visit_name": visit.visit_name})
+
+
+def _chunk_form(db: Session, row_id: int) -> None:
+    """Re-chunk the parent visit when a form is inserted/updated."""
+    form: ClinicalForm | None = db.query(ClinicalForm).get(row_id)
+    if not form:
+        return
+    # Delegate to visit chunker — it reads all forms for the visit
+    _chunk_visit(db, form.visit_id)
+
+
+# Dispatch table: table_name → chunker function
+_CHUNKERS: dict[str, callable] = {
+    "clinical_subjects": _chunk_subject,
+    "clinical_visits":   _chunk_visit,
+    "clinical_forms":    _chunk_form,
+}
+
+
+def process_pending(db: Session, batch_size: int = 50) -> int:
+    """
+    Drain the pending_ingestion queue. For each pending row, re-chunk the
+    corresponding clinical record and upsert into document_chunks.
+    Returns the number of rows processed.
+    """
+    rows = db.execute(
+        text("""
+            DELETE FROM pending_ingestion
+            WHERE id IN (
+                SELECT id FROM pending_ingestion
+                ORDER BY created_at
+                LIMIT :batch
+            )
+            RETURNING table_name, row_id
+        """),
+        {"batch": batch_size},
+    ).fetchall()
+
+    if not rows:
+        return 0
+
+    processed: int = 0
+    for row in rows:
+        chunker = _CHUNKERS.get(row.table_name)
+        if chunker:
+            try:
+                chunker(db, row.row_id)
+                processed += 1
+            except Exception as exc:
+                log.warning(
+                    "Auto-ingest failed for %s id=%d: %s",
+                    row.table_name, row.row_id, exc,
+                )
+
+    db.commit()
+    return processed
+
+
+def get_pending_count(db: Session) -> int:
+    """Return the number of rows waiting in the ingestion queue."""
+    result = db.execute(text("SELECT COUNT(*) FROM pending_ingestion")).scalar()
+    return result or 0

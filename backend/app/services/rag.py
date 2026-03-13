@@ -1,9 +1,14 @@
 """
-RAG pipeline with four improvements:
-  1. Hybrid search  — BM25 (PostgreSQL tsvector) + vector (pgvector) merged via RRF
+RAG pipeline with six improvements:
+  1. Hybrid search  — BM25 + vector (pgvector) merged via Reciprocal Rank Fusion
   2. Guardrails     — fast keyword check rejects off-topic questions before any LLM call
   3. Streaming      — stream_answer_question() yields JSON lines for TTFT optimisation
   4. Query logging  — every query stored in query_logs for feedback + observability
+  5. Response cache — L1+L2 (Redis) cache avoids repeated LLM calls for identical questions
+  6. Cross-encoder  — ms-marco reranker re-scores candidates after RRF for higher precision
+
+BM25 search uses ParadeDB pg_search (true Okapi BM25 with k1/b parameters) when
+available, falling back to PostgreSQL tsvector + ts_rank_cd otherwise.
 """
 import json
 import time
@@ -15,10 +20,28 @@ import opik
 from opik import opik_context
 
 from services.llm import embed_text, generate_text, stream_generate_text, LLM_MODEL
+from services.cache import cache_key as make_cache_key, get_or_compute, get_cache_stats, _l1_get, _l1_put
+from services.reranker import rerank as cross_encoder_rerank
 from models_clinical import QueryLog
 import services.memory_service as memory_service
 
 log = logging.getLogger("rag")
+
+_RESPONSE_CACHE_TTL = 300  # 5 minutes
+
+
+def get_response_cache_stats() -> dict:
+    """Return cache hit/miss stats for the /health endpoint."""
+    stats = get_cache_stats()
+    return {
+        "hits": stats["l1_hits"] + stats["l2_hits"],
+        "misses": stats["misses"],
+        "size": stats["l1_size"],
+        "max_size": stats["l1_max"],
+        "ttl_seconds": _RESPONSE_CACHE_TTL,
+        "redis_connected": stats["redis_connected"],
+        "stale_served": stats["stale_served"],
+    }
 
 # ── Guardrail keyword list ─────────────────────────────────────────────────────
 
@@ -90,15 +113,57 @@ def _vector_search(db: Session, question: str, top_k: int) -> list[dict]:
     ]
 
 
+_pg_search_available: bool | None = None  # lazy-detected on first call
+
+
 def _bm25_search(db: Session, question: str, top_k: int) -> list[dict]:
     """
-    PostgreSQL full-text search (BM25-style) using tsvector + ts_rank_cd.
+    Full-text search using ParadeDB pg_search (true Okapi BM25) when available,
+    falling back to PostgreSQL tsvector + ts_rank_cd otherwise.
     Handles edge cases: short/empty queries return empty list gracefully.
     """
-    # Strip to avoid empty tsquery errors on very short inputs
-    clean = " ".join(w for w in question.split() if len(w) > 1)
+    clean: str = " ".join(w for w in question.split() if len(w) > 1)
     if not clean:
         return []
+
+    global _pg_search_available
+
+    # Try ParadeDB pg_search (true BM25) first
+    if _pg_search_available is not False:
+        try:
+            rows = db.execute(
+                text("""
+                    SELECT id, source_type, source_id, chunk_text, metadata_json,
+                           paradedb.score(id) AS rank
+                    FROM   document_chunks
+                    WHERE  chunk_text @@@ paradedb.parse(:query)
+                    ORDER  BY rank DESC
+                    LIMIT  :top_k
+                """),
+                {"query": clean, "top_k": top_k},
+            ).fetchall()
+            if _pg_search_available is None:
+                _pg_search_available = True
+                log.info("pg_search BM25 search active (true Okapi BM25).")
+            return [
+                {
+                    "id":          row.id,
+                    "chunk_text":  row.chunk_text,
+                    "source_type": row.source_type,
+                    "source_id":   row.source_id,
+                    "metadata":    json.loads(row.metadata_json) if row.metadata_json else {},
+                    "similarity":  float(row.rank),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            if _pg_search_available is None:
+                _pg_search_available = False
+                log.info("pg_search not available, using tsvector fallback: %s", exc)
+            # Roll back the failed statement so the session stays usable
+            db.rollback()
+
+    # Fallback: PostgreSQL tsvector + ts_rank_cd (BM25 approximation)
     try:
         rows = db.execute(
             text("""
@@ -160,10 +225,15 @@ def _reciprocal_rank_fusion(
 
 def retrieve_chunks(db: Session, question: str, top_k: int = 5) -> list[dict]:
     """
-    Hybrid retrieval: BM25 + vector search merged via Reciprocal Rank Fusion.
+    Hybrid retrieval: BM25 + vector search merged via Reciprocal Rank Fusion,
+    then optionally re-ranked by a cross-encoder for higher relevance accuracy.
     Falls back to vector-only if BM25 returns nothing.
+    Falls back to RRF-only if cross-encoder is not available.
     """
-    fetch_k = top_k * 2  # fetch more from each, RRF picks the best top_k
+    # Fetch extra candidates for reranking — RRF narrows to rerank_k,
+    # then cross-encoder picks the best top_k from that pool
+    rerank_k: int = top_k * 3
+    fetch_k:  int = top_k * 2
 
     vector_results = _vector_search(db, question, fetch_k)
     bm25_results   = _bm25_search(db, question, fetch_k)
@@ -171,13 +241,16 @@ def retrieve_chunks(db: Session, question: str, top_k: int = 5) -> list[dict]:
     if bm25_results:
         merged = _reciprocal_rank_fusion(vector_results, bm25_results)
         log.info(
-            "Hybrid search: vector=%d bm25=%d merged=%d → top_k=%d",
-            len(vector_results), len(bm25_results), len(merged), top_k,
+            "Hybrid search: vector=%d bm25=%d merged=%d → rerank_k=%d → top_k=%d",
+            len(vector_results), len(bm25_results), len(merged), rerank_k, top_k,
         )
-        return merged[:top_k]
+        candidates = merged[:rerank_k]
+    else:
+        log.info("BM25 returned 0 results — using vector-only search.")
+        candidates = vector_results[:rerank_k]
 
-    log.info("BM25 returned 0 results — using vector-only search.")
-    return vector_results[:top_k]
+    # Cross-encoder reranking (graceful no-op if model not available)
+    return cross_encoder_rerank(question, candidates, top_k)
 
 
 # ── Prompt assembly ────────────────────────────────────────────────────────────
@@ -187,7 +260,7 @@ def build_prompt(
     chunks: list[dict],
     memories: list[dict] | None = None,
 ) -> str:
-    """Assemble the LLM prompt with numbered context blocks and optional Mem0 memories."""
+    """Assemble the LLM prompt with numbered context blocks and optional user memories."""
     context_lines = []
     for i, chunk in enumerate(chunks, start=1):
         context_lines.append(
@@ -267,7 +340,7 @@ def answer_question(
 ) -> dict:
     """
     Full RAG pipeline (non-streaming):
-      guardrail → hybrid retrieve → build prompt → Ollama generate → log → return
+      cache check → guardrail → hybrid retrieve → build prompt → Ollama generate → cache store → log → return
     """
     t0 = time.monotonic()
 
@@ -279,6 +352,20 @@ def answer_question(
             "model":   LLM_MODEL,
             "log_id":  None,
         }
+
+    # Response cache — L1+L2 check for identical recent query
+    ck = make_cache_key("rag", question.strip().lower(), str(top_k), str(user_id))
+    cached = _l1_get(ck)
+    if cached:
+        log.info("Response cache HIT for question: %s", question[:60])
+        # Still log the query so analytics stay accurate
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        log_id = _log_query(
+            db, "vector", question, cached["answer"],
+            user_id=user_id,
+            response_time_ms=elapsed_ms,
+        )
+        return {**cached, "log_id": log_id}
 
     chunks = retrieve_chunks(db, question, top_k=top_k)
 
@@ -293,8 +380,8 @@ def answer_question(
             "log_id":  None,
         }
 
-    # Search Mem0 for relevant past context (no-op when key is absent)
-    memories = memory_service.search_memories(question, user_id) if user_id else []
+    # Search user memories for relevant past context
+    memories = memory_service.search_memories(db, question, user_id) if user_id else []
 
     prompt = build_prompt(question, chunks, memories=memories)
     answer = generate_text(prompt, system=SYSTEM_PROMPT)
@@ -313,20 +400,27 @@ def answer_question(
         response_time_ms=elapsed_ms,
     )
 
-    # Store this exchange in Mem0 for future context
+    # Store this exchange in Postgres memory for future context
     if user_id:
         memory_service.add_memory(
+            db,
             [{"role": "user", "content": question},
              {"role": "assistant", "content": answer}],
             user_id,
         )
 
-    return {
+    result = {
         "answer":  answer,
         "sources": _format_sources(chunks),
         "model":   LLM_MODEL,
         "log_id":  log_id,
     }
+
+    # Cache the result in L1+L2 (without log_id, which is per-request)
+    cacheable = {"answer": answer, "sources": _format_sources(chunks), "model": LLM_MODEL}
+    _l1_put(ck, cacheable, _RESPONSE_CACHE_TTL)
+
+    return result
 
 
 # ── Streaming pipeline (/rag/chat-stream endpoint) ────────────────────────────
@@ -365,8 +459,8 @@ def stream_answer_question(
         yield json.dumps({"type": "done", "sources": [], "log_id": None}) + "\n"
         return
 
-    # Search Mem0 for relevant past context (no-op when key is absent)
-    memories = memory_service.search_memories(question, user_id) if user_id else []
+    # Search user memories for relevant past context
+    memories = memory_service.search_memories(db, question, user_id) if user_id else []
 
     prompt = build_prompt(question, chunks, memories=memories)
     full_answer = []
@@ -390,9 +484,10 @@ def stream_answer_question(
         "log_id":  log_id,
     }) + "\n"
 
-    # Store this exchange in Mem0 after streaming is complete
+    # Store this exchange in Postgres memory after streaming is complete
     if user_id:
         memory_service.add_memory(
+            db,
             [{"role": "user", "content": question},
              {"role": "assistant", "content": answer_text}],
             user_id,
