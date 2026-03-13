@@ -115,3 +115,35 @@ class DocumentChunk(Base):
     embedding     = Column(Text)        # real type: vector(768) — set via raw DDL
     metadata_json = Column(Text)
     created_at    = Column(DateTime, default=_now)
+
+
+class PendingIngestion(Base):
+    """
+    Queue table for auto-vectorization. Postgres triggers on clinical tables
+    insert rows here on INSERT/UPDATE. A background worker drains this queue,
+    chunking and embedding each row into document_chunks.
+    """
+    __tablename__ = "pending_ingestion"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    table_name = Column(String, nullable=False)    # e.g. 'clinical_subjects'
+    row_id     = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=_now)
+
+
+class UserMemory(Base):
+    """
+    Postgres-native per-user memory for RAG context enrichment.
+    Replaces the external Mem0 cloud service. Stores extracted facts from
+    conversations with pgvector embeddings for semantic search.
+    The 'embedding' column is vector(768) in PostgreSQL (set via raw DDL
+    alongside document_chunks). SQLAlchemy sees it as Text.
+    """
+    __tablename__ = "user_memories"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    memory_text = Column(Text, nullable=False)
+    embedding   = Column(Text)          # real type: vector(768) — set via raw DDL
+    created_at  = Column(DateTime, default=_now)
+    updated_at  = Column(DateTime, default=_now, onupdate=_now)

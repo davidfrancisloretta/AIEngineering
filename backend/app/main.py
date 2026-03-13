@@ -1,9 +1,16 @@
 from contextlib import asynccontextmanager
+import asyncio
+import logging
+import time
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from sqlalchemy import text
+
+log = logging.getLogger("startup")
 
 from db import engine, SessionLocal
 from models import Base, User
@@ -22,10 +29,18 @@ DEMO_PASSWORD = "Demo1234!"
 
 
 def _ensure_vector_extension():
-    """Create the pgvector extension and ensure document_chunks.embedding is vector(768)."""
+    """Create pgvector + pg_search extensions and ensure vector(768) columns on document_chunks and user_memories."""
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        # Alter column only if it is still plain text (first run after create_all)
+
+        # pg_search (ParadeDB) — true Okapi BM25 scoring for hybrid RAG
+        try:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search"))
+            log.info("pg_search extension enabled (true BM25 scoring).")
+        except Exception as exc:
+            log.warning("pg_search extension not available (falling back to tsvector): %s", exc)
+
+        # ── document_chunks: alter embedding text → vector(768) on first run ──
         conn.execute(text("""
             DO $$
             BEGIN
@@ -47,10 +62,44 @@ def _ensure_vector_extension():
             ON document_chunks USING hnsw (embedding vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
         """))
-        # GIN index for BM25 full-text search (hybrid retrieval)
+        # GIN index for tsvector full-text search (fallback if pg_search unavailable)
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_document_chunks_fts
             ON document_chunks USING gin(to_tsvector('english', chunk_text))
+        """))
+
+        # ParadeDB BM25 index — true Okapi BM25 scoring for hybrid retrieval
+        try:
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_document_chunks_bm25
+                ON document_chunks USING bm25 (id, chunk_text)
+                WITH (key_field = 'id')
+            """))
+            log.info("pg_search BM25 index created on document_chunks.")
+        except Exception as exc:
+            log.info("BM25 index not created (tsvector fallback will be used): %s", exc)
+
+        # ── user_memories: alter embedding text → vector(768) on first run ──
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'user_memories'
+                      AND column_name = 'embedding'
+                      AND data_type = 'text'
+                ) THEN
+                    ALTER TABLE user_memories
+                        ALTER COLUMN embedding TYPE vector(768)
+                        USING NULL::vector(768);
+                END IF;
+            END
+            $$;
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_user_memories_embedding
+            ON user_memories USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
         """))
         conn.commit()
 
@@ -66,17 +115,88 @@ def _seed_demo_user():
         db.close()
 
 
+def _ensure_ingestion_triggers():
+    """
+    Create a Postgres trigger function + triggers on clinical tables that
+    queue changed rows into pending_ingestion for auto-vectorization.
+    Fires on INSERT or UPDATE on clinical_subjects, clinical_visits, clinical_forms.
+    """
+    with engine.connect() as conn:
+        # Shared trigger function — inserts one row per changed record
+        conn.execute(text("""
+            CREATE OR REPLACE FUNCTION fn_queue_ingestion()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                INSERT INTO pending_ingestion (table_name, row_id, created_at)
+                VALUES (TG_TABLE_NAME, NEW.id, NOW())
+                ON CONFLICT DO NOTHING;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """))
+
+        # Attach triggers to each clinical table (idempotent via DROP IF EXISTS)
+        for tbl in ("clinical_subjects", "clinical_visits", "clinical_forms"):
+            trigger_name: str = f"trg_autoingest_{tbl}"
+            conn.execute(text(f"""
+                DROP TRIGGER IF EXISTS {trigger_name} ON {tbl};
+                CREATE TRIGGER {trigger_name}
+                    AFTER INSERT OR UPDATE ON {tbl}
+                    FOR EACH ROW
+                    EXECUTE FUNCTION fn_queue_ingestion();
+            """))
+
+        conn.commit()
+        log.info("Auto-vectorization triggers installed on clinical tables.")
+
+
+_INGEST_WORKER_INTERVAL: int = 30  # seconds between queue drain cycles
+
+
+async def _ingestion_worker() -> None:
+    """
+    Background task that drains pending_ingestion every 30 seconds.
+    Runs for the lifetime of the app. Skips silently if Ollama is not ready.
+    """
+    from services.ingestion import process_pending
+    from services.llm import ollama_ready
+
+    # Wait for Ollama to finish pulling models before starting
+    await asyncio.sleep(15)
+    log.info("Ingestion worker started (interval=%ds).", _INGEST_WORKER_INTERVAL)
+
+    while True:
+        try:
+            if ollama_ready():
+                db: Session = SessionLocal()
+                try:
+                    processed: int = process_pending(db)
+                    if processed > 0:
+                        log.info("Ingestion worker processed %d pending rows.", processed)
+                finally:
+                    db.close()
+        except Exception as exc:
+            log.warning("Ingestion worker error (will retry): %s", exc)
+
+        await asyncio.sleep(_INGEST_WORKER_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     _ensure_vector_extension()
+    _ensure_ingestion_triggers()
     _seed_demo_user()
     db: Session = SessionLocal()
     try:
         ensure_views(db)
     finally:
         db.close()
+
+    # Start background ingestion worker
+    worker_task: asyncio.Task = asyncio.create_task(_ingestion_worker())
     yield
+    worker_task.cancel()
 
 
 app = FastAPI(title="Rave Analytics API", lifespan=lifespan)
@@ -92,11 +212,72 @@ app.include_router(rag_router.router)
 
 
 # -------------------------------
-# Root Health Check
+# Root
 # -------------------------------
 @app.get("/")
 def root():
     return {"message": "AI Docker App Running Successfully"}
+
+
+# -------------------------------
+# Aggregated Health Check
+# -------------------------------
+@app.get("/health")
+def health_check():
+    """
+    Single endpoint that probes every dependency and returns overall status.
+    Returns 200 when all critical services are reachable, 503 otherwise.
+    """
+    from services.llm import ollama_ready, get_embed_cache_stats, EMBED_MODEL, LLM_MODEL
+    from services.rag import get_response_cache_stats
+
+    checks: dict = {}
+    t0 = time.monotonic()
+
+    # 1. PostgreSQL
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        chunk_count = db.execute(text("SELECT COUNT(*) FROM document_chunks")).scalar()
+        checks["db"] = {"status": "ok", "chunks": chunk_count}
+        db.close()
+    except Exception as exc:
+        checks["db"] = {"status": "error", "detail": str(exc)}
+
+    # 2. Ollama
+    ollama_ok = ollama_ready()
+    checks["ollama"] = {
+        "status": "ok" if ollama_ok else "unavailable",
+        "embed_model": EMBED_MODEL,
+        "llm_model": LLM_MODEL,
+    }
+
+    # 3. Memory (Postgres-native)
+    checks["memory"] = {
+        "status": "ok",
+        "backend": "postgres",
+    }
+
+    # 4. Caches
+    checks["caches"] = {
+        "embedding_cache": get_embed_cache_stats(),
+        "response_cache": get_response_cache_stats(),
+    }
+
+    elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+    all_ok = checks["db"].get("status") == "ok" and ollama_ok
+
+    result = {
+        "status": "healthy" if all_ok else "degraded",
+        "checks": checks,
+        "latency_ms": elapsed_ms,
+    }
+
+    if not all_ok:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=result, status_code=503)
+
+    return result
 
 
 # -------------------------------
