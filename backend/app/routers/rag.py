@@ -1,4 +1,6 @@
 import time
+import asyncio
+import logging
 import threading
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,8 +29,41 @@ import services.ingestion as ingestion_service
 import services.text_to_sql as text_to_sql_service
 import services.memory_service as memory_service
 from services.llm import ollama_ready, list_models, EMBED_MODEL, LLM_MODEL, get_embed_cache_stats
+from services.cache import cache_key, get_or_compute
+
+log = logging.getLogger("rag_router")
 
 router = APIRouter(prefix="/rag", tags=["rag"])
+
+
+# ── In-memory rate limiter (per-user, no extra dependency) ─────────────────────
+
+_RATE_LIMIT_MAX = 10        # max requests per window
+_RATE_LIMIT_WINDOW = 60     # window in seconds
+_rate_buckets: dict[int, list[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def _check_rate_limit(user_id: int) -> None:
+    """
+    Enforce per-user rate limiting on LLM-heavy endpoints.
+    Raises HTTPException(429) if the user exceeds the limit.
+    """
+    now = time.monotonic()
+    with _rate_lock:
+        timestamps = _rate_buckets.get(user_id, [])
+        # Prune timestamps outside the window
+        timestamps = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
+        if len(timestamps) >= _RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded: max {_RATE_LIMIT_MAX} requests "
+                    f"per {_RATE_LIMIT_WINDOW}s. Please wait before retrying."
+                ),
+            )
+        timestamps.append(now)
+        _rate_buckets[user_id] = timestamps
 
 
 # ── Background ingestion state ─────────────────────────────────────────────────
@@ -43,9 +78,11 @@ _ingest_state: dict = {
 _ingest_lock = threading.Lock()
 
 
-def _run_ingest(total_estimate: int) -> None:
-    """Runs in a daemon thread; creates its own DB session."""
-    global _ingest_state
+def _run_ingest_sync() -> None:
+    """
+    Runs ingestion in a dedicated thread via asyncio.to_thread().
+    Creates its own DB session to avoid cross-thread session issues.
+    """
     db = SessionLocal()
     try:
         def _on_progress(done: int) -> None:
@@ -59,7 +96,9 @@ def _run_ingest(total_estimate: int) -> None:
                 "done":           count,
                 "chunks_created": count,
             })
+        log.info("Ingestion completed: %d chunks created", count)
     except Exception as exc:
+        log.error("Ingestion failed: %s", exc)
         with _ingest_lock:
             _ingest_state.update({"status": "error", "error": str(exc)})
     finally:
@@ -87,17 +126,16 @@ def rag_status(
 
 
 @router.post("/ingest", response_model=RAGIngestStatusResponse)
-def ingest_clinical_data(
+async def ingest_clinical_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Start background ingestion of all clinical trial data.
+    Uses asyncio.to_thread() for safe background execution.
     Returns immediately with status="running".
     Poll GET /rag/ingest-status for progress.
     """
-    global _ingest_state
-
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
@@ -120,8 +158,8 @@ def ingest_clinical_data(
             "error":          None,
         })
 
-    t = threading.Thread(target=_run_ingest, args=(total_estimate,), daemon=True)
-    t.start()
+    # Schedule ingestion in a background thread managed by asyncio
+    asyncio.get_event_loop().run_in_executor(None, _run_ingest_sync)
 
     return dict(_ingest_state)
 
@@ -135,6 +173,16 @@ def ingest_status(
         return dict(_ingest_state)
 
 
+@router.get("/ingestion-queue")
+def ingestion_queue_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the number of rows waiting in the auto-vectorization queue."""
+    pending: int = ingestion_service.get_pending_count(db)
+    return {"pending": pending}
+
+
 @router.post("/chat", response_model=RAGChatResponse)
 def chat(
     body: RAGChatRequest,
@@ -144,7 +192,9 @@ def chat(
     """
     Non-streaming RAG: embed → hybrid search (BM25+vector+RRF) → LLM → answer.
     Guardrail rejects off-topic questions. Query logged for feedback.
+    Rate limited to prevent Ollama queue pile-up.
     """
+    _check_rate_limit(current_user.id)
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
@@ -166,7 +216,9 @@ def chat_stream(
     Streaming RAG: hybrid retrieve → stream LLM tokens → send sources + log_id at end.
     Returns newline-delimited JSON (application/x-ndjson).
     Each line: {"type":"token","text":"..."} | {"type":"done","sources":[...],"log_id":N}
+    Rate limited to prevent Ollama queue pile-up.
     """
+    _check_rate_limit(current_user.id)
     if not ollama_ready():
         raise HTTPException(
             status_code=503,
@@ -189,7 +241,9 @@ def sql_query(
     """
     Text-to-SQL: question → llama3.2:3b → SQL → execute → LLM summary.
     HealerAgent retries broken SQL up to 1 time. Query logged for feedback.
+    Rate limited to prevent Ollama queue pile-up.
     """
+    _check_rate_limit(current_user.id)
     history = [msg.model_dump() for msg in body.history] if body.history else []
     t0 = time.monotonic()
     try:
@@ -244,13 +298,14 @@ def submit_feedback(
 
 @router.get("/memories")
 def get_memories(
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Return all Mem0 memories stored for the current user.
-    Returns {"enabled": false, "memories": []} when MEM0_API_KEY is not set.
+    Return all Postgres-native memories stored for the current user.
+    Always enabled — backed by the local pgvector database.
     """
-    memories = memory_service.get_all_memories(current_user.id)
+    memories: list[dict] = memory_service.get_all_memories(db, current_user.id)
     return {
         "enabled":  memory_service.is_enabled(),
         "memories": memories,
@@ -260,10 +315,11 @@ def get_memories(
 
 @router.delete("/memories")
 def delete_memories(
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Delete all Mem0 memories for the current user."""
-    success = memory_service.delete_all_memories(current_user.id)
+    """Delete all memories for the current user."""
+    success: bool = memory_service.delete_all_memories(db, current_user.id)
     return {"ok": success, "enabled": memory_service.is_enabled()}
 
 
@@ -274,28 +330,32 @@ def analytics_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Aggregate totals across all query_logs: counts, avg response time, feedback."""
-    row = db.execute(text("""
-        SELECT
-            COUNT(*)                                                        AS total_queries,
-            SUM(CASE WHEN query_type = 'vector' THEN 1 ELSE 0 END)         AS vector_queries,
-            SUM(CASE WHEN query_type = 'sql'    THEN 1 ELSE 0 END)         AS sql_queries,
-            COALESCE(AVG(response_time_ms), 0)                             AS avg_response_ms,
-            SUM(CASE WHEN feedback =  1    THEN 1 ELSE 0 END)              AS thumbs_up,
-            SUM(CASE WHEN feedback = -1    THEN 1 ELSE 0 END)              AS thumbs_down,
-            SUM(CASE WHEN feedback IS NULL THEN 1 ELSE 0 END)              AS unrated
-        FROM query_logs
-    """)).fetchone()
+    """Aggregate totals across all query_logs: counts, avg response time, feedback.  Cached 2min."""
+    def _compute():
+        row = db.execute(text("""
+            SELECT
+                COUNT(*)                                                        AS total_queries,
+                SUM(CASE WHEN query_type = 'vector' THEN 1 ELSE 0 END)         AS vector_queries,
+                SUM(CASE WHEN query_type = 'sql'    THEN 1 ELSE 0 END)         AS sql_queries,
+                COALESCE(AVG(response_time_ms), 0)                             AS avg_response_ms,
+                SUM(CASE WHEN feedback =  1    THEN 1 ELSE 0 END)              AS thumbs_up,
+                SUM(CASE WHEN feedback = -1    THEN 1 ELSE 0 END)              AS thumbs_down,
+                SUM(CASE WHEN feedback IS NULL THEN 1 ELSE 0 END)              AS unrated
+            FROM query_logs
+        """)).fetchone()
+        return {
+            "total_queries":   row.total_queries   or 0,
+            "vector_queries":  row.vector_queries  or 0,
+            "sql_queries":     row.sql_queries     or 0,
+            "avg_response_ms": float(row.avg_response_ms or 0),
+            "thumbs_up":       row.thumbs_up       or 0,
+            "thumbs_down":     row.thumbs_down     or 0,
+            "unrated":         row.unrated         or 0,
+        }
 
-    return {
-        "total_queries":   row.total_queries   or 0,
-        "vector_queries":  row.vector_queries  or 0,
-        "sql_queries":     row.sql_queries     or 0,
-        "avg_response_ms": float(row.avg_response_ms or 0),
-        "thumbs_up":       row.thumbs_up       or 0,
-        "thumbs_down":     row.thumbs_down     or 0,
-        "unrated":         row.unrated         or 0,
-    }
+    return get_or_compute(
+        cache_key("analytics", "summary"), _compute, ttl=120,
+    )
 
 
 @router.get("/analytics/daily", response_model=list[RAGDailyStats])
@@ -303,28 +363,32 @@ def analytics_daily(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Per-day query counts and avg response time for the last 14 days, split by query_type."""
-    rows = db.execute(text("""
-        SELECT
-            TO_CHAR(DATE(created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
-            query_type,
-            COUNT(*)                                 AS count,
-            COALESCE(AVG(response_time_ms), 0)       AS avg_ms
-        FROM  query_logs
-        WHERE created_at >= NOW() - INTERVAL '14 days'
-        GROUP BY day, query_type
-        ORDER BY day, query_type
-    """)).fetchall()
+    """Per-day query counts and avg response time for the last 14 days.  Cached 2min."""
+    def _compute():
+        rows = db.execute(text("""
+            SELECT
+                TO_CHAR(DATE(created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+                query_type,
+                COUNT(*)                                 AS count,
+                COALESCE(AVG(response_time_ms), 0)       AS avg_ms
+            FROM  query_logs
+            WHERE created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY day, query_type
+            ORDER BY day, query_type
+        """)).fetchall()
+        return [
+            {
+                "day":        row.day,
+                "query_type": row.query_type,
+                "count":      row.count,
+                "avg_ms":     float(row.avg_ms),
+            }
+            for row in rows
+        ]
 
-    return [
-        {
-            "day":        row.day,
-            "query_type": row.query_type,
-            "count":      row.count,
-            "avg_ms":     float(row.avg_ms),
-        }
-        for row in rows
-    ]
+    return get_or_compute(
+        cache_key("analytics", "daily"), _compute, ttl=120,
+    )
 
 
 @router.get("/analytics/top-questions", response_model=list[RAGTopQuestion])
@@ -332,28 +396,32 @@ def analytics_top_questions(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Top 10 most-asked questions with counts, avg response time, and feedback tallies."""
-    rows = db.execute(text("""
-        SELECT
-            question,
-            COUNT(*)                                                    AS count,
-            COALESCE(AVG(response_time_ms), 0)                         AS avg_ms,
-            SUM(CASE WHEN feedback =  1 THEN 1 ELSE 0 END)             AS thumbs_up,
-            SUM(CASE WHEN feedback = -1 THEN 1 ELSE 0 END)             AS thumbs_down
-        FROM  query_logs
-        GROUP BY question
-        ORDER BY count DESC
-        LIMIT 10
-    """)).fetchall()
+    """Top 10 most-asked questions with counts, avg response time, and feedback tallies.  Cached 2min."""
+    def _compute():
+        rows = db.execute(text("""
+            SELECT
+                question,
+                COUNT(*)                                                    AS count,
+                COALESCE(AVG(response_time_ms), 0)                         AS avg_ms,
+                SUM(CASE WHEN feedback =  1 THEN 1 ELSE 0 END)             AS thumbs_up,
+                SUM(CASE WHEN feedback = -1 THEN 1 ELSE 0 END)             AS thumbs_down
+            FROM  query_logs
+            GROUP BY question
+            ORDER BY count DESC
+            LIMIT 10
+        """)).fetchall()
+        return [
+            {
+                "question":   row.question,
+                "count":      row.count,
+                "avg_ms":     float(row.avg_ms),
+                "avg_s":      f"{float(row.avg_ms) / 1000:.2f}s" if row.avg_ms > 0 else "—",
+                "thumbs_up":  row.thumbs_up  or 0,
+                "thumbs_down": row.thumbs_down or 0,
+            }
+            for row in rows
+        ]
 
-    return [
-        {
-            "question":   row.question,
-            "count":      row.count,
-            "avg_ms":     float(row.avg_ms),
-            "avg_s":      f"{float(row.avg_ms) / 1000:.2f}s" if row.avg_ms > 0 else "—",
-            "thumbs_up":  row.thumbs_up  or 0,
-            "thumbs_down": row.thumbs_down or 0,
-        }
-        for row in rows
-    ]
+    return get_or_compute(
+        cache_key("analytics", "top-questions"), _compute, ttl=120,
+    )
